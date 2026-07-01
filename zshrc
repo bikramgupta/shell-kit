@@ -74,4 +74,4 @@ fi
 # WELCOME MESSAGE
 # ============================================================================
 
-printf "\n  \033[1mghelp\033[0m git/worktree  •  \033[1mdkhelp\033[0m docker  •  \033[1mhunt -h\033[0m search  •  \033[1mclaude-session-analyzer\033[0m sessions\n\n"
+printf "\n  \033[1mghelp\033[0m git/worktree  •  \033[1mdkhelp\033[0m docker  •  \033[1mhunt -h\033[0m search  •  \033[1mclaude-session-analyzer\033[0m sessions  •  \033[1mclaude-telemetry\033[0m metrics\n\n"
