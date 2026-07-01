@@ -28,4 +28,6 @@ fi
 ## Workflow
 
 - I typically run with `--dangerously-skip-permissions` in dev containers
-- Environment variables are auto-loaded from `~/.env-dev` and `.env` at session start
+- Environment variables are auto-loaded **per project** at session start: the
+  SessionStart hook sources `.env` and `.env.local` from the current git root (or cwd).
+  Each project keeps its own env; nothing is read from `$HOME`.

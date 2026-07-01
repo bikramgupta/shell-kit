@@ -54,6 +54,14 @@ if [[ -f $(brew --prefix)/share/zsh-syntax-highlighting/zsh-syntax-highlighting.
 fi
 
 # ============================================================================
+# LOCAL OVERRIDES (machine-specific, NOT tracked by shell-kit)
+# ============================================================================
+# Personal aliases, exports, PATH additions, and installer-added lines belong
+# in ~/.zshrc.local. deploy.sh overwrites ~/.zshrc but never touches this file,
+# so `deploy.sh --force` can never clobber your local customizations.
+[[ -f ~/.zshrc.local ]] && source ~/.zshrc.local
+
+# ============================================================================
 # QUICK REFERENCE
 # ============================================================================
 # Run these for help:

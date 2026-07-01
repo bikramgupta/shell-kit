@@ -1,0 +1,72 @@
+# Claude Code local observability stack
+# OpenTelemetry Collector -> Prometheus -> Grafana
+#
+# Start with:  claude-telemetry up   (see .zsh/observability.zsh)
+# Or directly: docker compose -f docker-compose.yml up -d
+#
+# Compose project name (containers/network prefixed with this).
+name: claude-obs
+
+services:
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector (contrib build - has the prometheus exporter).
+  # Receives OTLP from Claude Code, re-exposes metrics for Prometheus to scrape.
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: claude-obs-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC   (OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317)
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter scrape target
+    networks:
+      - claude-obs
+
+  # ---------------------------------------------------------------------------
+  # Prometheus - scrapes the collector's prometheus exporter, stores the series.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: claude-obs-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"   # http://localhost:9090
+    networks:
+      - claude-obs
+    depends_on:
+      - otel-collector
+
+  # ---------------------------------------------------------------------------
+  # Grafana - dashboards. Anonymous admin access for a frictionless local UI.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: claude-obs-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    ports:
+      - "3000:3000"   # http://localhost:3000
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - claude-obs
+    depends_on:
+      - prometheus
+
+networks:
+  claude-obs:
+    driver: bridge
+
+volumes:
+  grafana-data:

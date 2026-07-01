@@ -261,7 +261,7 @@ deploy_claude_settings() {
 
   echo -e "${YELLOW}Deploying Claude settings...${NC}"
 
-  mkdir -p "$HOME_CLAUDE_DIR"/{hooks,commands,agents,tools}
+  mkdir -p "$HOME_CLAUDE_DIR"/{commands,agents,tools,observability}
 
   # Core files
   for f in CLAUDE.md settings.json statusline.sh; do
@@ -271,14 +271,31 @@ deploy_claude_settings() {
     fi
   done
 
-  # Hooks
-  for f in "$LOCAL_CLAUDE_DIR/hooks"/*.sh; do
-    if [[ -f "$f" ]]; then
-      cp "$f" "$HOME_CLAUDE_DIR/hooks/"
-      chmod +x "$HOME_CLAUDE_DIR/hooks/$(basename "$f")"
-      echo -e "  ${GREEN}Deployed:${NC} ~/.claude/hooks/$(basename "$f")"
+  # Remove legacy event-logging hooks (superseded by transcripts + OTEL telemetry)
+  if [[ -d "$HOME_CLAUDE_DIR/hooks" ]]; then
+    rm -f "$HOME_CLAUDE_DIR/hooks/log-tool-calls.sh" "$HOME_CLAUDE_DIR/hooks/log-session-start.sh"
+    rmdir "$HOME_CLAUDE_DIR/hooks" 2>/dev/null || true
+    echo -e "  ${YELLOW}Removed:${NC} legacy ~/.claude/hooks logging scripts"
+  fi
+
+  # Observability stack (OTEL collector + Prometheus + Grafana; Tier 3)
+  if [[ -d "$LOCAL_CLAUDE_DIR/observability" ]]; then
+    cp -r "$LOCAL_CLAUDE_DIR/observability/"* "$HOME_CLAUDE_DIR/observability/" 2>/dev/null || true
+    echo -e "  ${GREEN}Deployed:${NC} ~/.claude/observability/"
+
+    # Tier 3 dashboards need Docker. Never fail the deploy over it: telemetry stays
+    # enabled system-wide in settings.json, and Claude Code's OTLP export silently
+    # no-ops when nothing is listening. Just warn so the user knows what to do.
+    if ! command -v docker >/dev/null 2>&1; then
+      echo -e "  ${YELLOW}WARNING:${NC} Docker not found — Tier 3 telemetry dashboards are bypassed."
+      echo -e "           Claude Code's OTLP export fails silently (no session impact)."
+      echo -e "           Install Docker, then run 'claude-telemetry up' to enable Grafana."
+    elif ! docker info >/dev/null 2>&1; then
+      echo -e "  ${YELLOW}Telemetry:${NC} Docker installed but not running — start Docker, then 'claude-telemetry up'."
+    else
+      echo -e "  ${GREEN}Telemetry:${NC} Docker detected — run 'claude-telemetry up' for Grafana dashboards."
     fi
-  done
+  fi
 
   # Commands
   if [[ -d "$LOCAL_CLAUDE_DIR/commands" ]]; then
@@ -446,5 +463,6 @@ echo "Quick help:"
 echo "  ghelp                    - Git commands"
 echo "  dkhelp                   - Docker commands"
 echo "  hunt -h                  - Search commands"
-echo "  claude-session-analyzer  - Analyze Claude sessions"
-echo "  codex-session-analyzer   - Analyze Codex sessions"
+echo "  claude-session-analyzer  - Analyze Claude sessions (tokens + cost)"
+echo "  codex-session-analyzer   - Analyze Codex sessions (tokens + cost)"
+echo "  claude-telemetry help    - Local OTEL + Grafana stack (cc-obs)"

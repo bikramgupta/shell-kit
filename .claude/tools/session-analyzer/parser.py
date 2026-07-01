@@ -270,6 +270,10 @@ def extract_session_summary(filepath: Path) -> dict:
     start_time = None
     end_time = None
     project = None
+    # Token/cost totals for this transcript (main agent only — subagent
+    # transcripts are separate files; the digest/HTML show the full breakdown).
+    tok_totals = {k: 0 for k in _TOKEN_FIELDS}
+    tok_cost = 0.0
 
     try:
         with open(filepath) as f:
@@ -296,6 +300,15 @@ def extract_session_summary(filepath: Path) -> dict:
                     if not project and entry.get("cwd"):
                         project = entry["cwd"]
 
+                    # Accumulate token usage / cost
+                    u = extract_usage(entry)
+                    if u:
+                        for k in _TOKEN_FIELDS:
+                            tok_totals[k] += u[k]
+                        tok_cost += estimate_cost(
+                            u["model"], u["input_tokens"], u["output_tokens"],
+                            u["cache_creation_input_tokens"], u["cache_read_input_tokens"])
+
                 except json.JSONDecodeError:
                     continue
     except Exception:
@@ -320,6 +333,8 @@ def extract_session_summary(filepath: Path) -> dict:
         "duration_mins": duration_mins,
         "project": project,
         "mtime": filepath.stat().st_mtime,
+        "total_tokens": sum(tok_totals.values()),
+        "cost": tok_cost,
     }
 
 
@@ -377,6 +392,119 @@ def list_sessions(project_path: Optional[str] = None, fallback_global: bool = Tr
     sessions.sort(key=lambda s: s.get("mtime", 0), reverse=True)
 
     return sessions
+
+
+# ---------------------------------------------------------------------------
+# Token & cost accounting
+#
+# Estimated USD prices per 1,000,000 tokens. These are ESTIMATES for local
+# accounting only. Run /cost in a session, or use the Anthropic Usage & Cost
+# API, for authoritative billing. Update these when Anthropic pricing changes.
+# Convention (Anthropic prompt caching): cache write = 1.25x input (5m TTL),
+# cache read = 0.10x input.
+# ---------------------------------------------------------------------------
+MODEL_PRICING_PER_MTOK = {
+    "opus":   {"input": 5.0,  "output": 25.0},
+    "sonnet": {"input": 3.0,  "output": 15.0},
+    "haiku":  {"input": 1.0,  "output": 5.0},
+    "fable":  {"input": 10.0, "output": 50.0},
+    "mythos": {"input": 10.0, "output": 50.0},
+}
+DEFAULT_PRICING_PER_MTOK = {"input": 5.0, "output": 25.0}
+
+
+def price_for_model(model: str) -> dict:
+    """Match a model id (e.g. 'claude-opus-4-8') to a pricing family by substring."""
+    m = (model or "").lower()
+    for family, price in MODEL_PRICING_PER_MTOK.items():
+        if family in m:
+            return price
+    return DEFAULT_PRICING_PER_MTOK
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int,
+                  cache_creation_tokens: int, cache_read_tokens: int) -> float:
+    """Estimate USD cost for one message's usage. Estimate only — see /cost."""
+    p = price_for_model(model)
+    return (
+        input_tokens * p["input"]
+        + output_tokens * p["output"]
+        + cache_creation_tokens * p["input"] * 1.25
+        + cache_read_tokens * p["input"] * 0.10
+    ) / 1_000_000
+
+
+def extract_usage(entry: dict) -> Optional[dict]:
+    """Extract per-message token usage + model from an assistant transcript entry.
+
+    The transcript JSONL is an internal/unstable format; parse defensively and
+    return None for anything without a usage block.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+        return None
+    message = entry.get("message") or {}
+    usage = message.get("usage") or entry.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "model": message.get("model") or entry.get("model") or "unknown",
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens") or 0,
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens") or 0,
+    }
+
+
+_TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                 "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def aggregate_tokens(entries: list[dict]) -> dict:
+    """Sum token usage across transcript entries → totals, per-model, cost estimate."""
+    totals = {k: 0 for k in _TOKEN_FIELDS}
+    per_model = {}
+    cost = 0.0
+    for entry in entries:
+        u = extract_usage(entry)
+        if not u:
+            continue
+        for k in _TOKEN_FIELDS:
+            totals[k] += u[k]
+        pm = per_model.setdefault(u["model"], {**{k: 0 for k in _TOKEN_FIELDS}, "cost": 0.0})
+        for k in _TOKEN_FIELDS:
+            pm[k] += u[k]
+        c = estimate_cost(u["model"], u["input_tokens"], u["output_tokens"],
+                          u["cache_creation_input_tokens"], u["cache_read_input_tokens"])
+        pm["cost"] += c
+        cost += c
+    return {
+        "totals": totals,
+        "total_tokens": sum(totals.values()),
+        "per_model": per_model,
+        "cost": cost,
+    }
+
+
+def combine_token_aggregates(aggs: list[dict]) -> dict:
+    """Merge several aggregate_tokens() results into one session-level total."""
+    totals = {k: 0 for k in _TOKEN_FIELDS}
+    per_model = {}
+    cost = 0.0
+    for agg in aggs:
+        for k in _TOKEN_FIELDS:
+            totals[k] += agg["totals"][k]
+        cost += agg["cost"]
+        for model, pm in agg["per_model"].items():
+            dst = per_model.setdefault(model, {**{k: 0 for k in _TOKEN_FIELDS}, "cost": 0.0})
+            for k in _TOKEN_FIELDS:
+                dst[k] += pm[k]
+            dst["cost"] += pm["cost"]
+    return {
+        "totals": totals,
+        "total_tokens": sum(totals.values()),
+        "per_model": per_model,
+        "cost": cost,
+    }
 
 
 def parse_jsonl(filepath: Path) -> list[dict]:
@@ -635,13 +763,14 @@ def extract_cloud_metadata(entries: list[dict]) -> dict:
     cloud_stats["request_ids"] = list(cloud_stats["request_ids"])
     cloud_stats["message_ids"] = list(cloud_stats["message_ids"])
 
-    # Calculate estimated cost (using approximate public pricing)
-    # Opus: $15/MTok input, $75/MTok output, cache read $1.50/MTok
-    input_cost = (cloud_stats["total_input_tokens"] / 1_000_000) * 15
-    output_cost = (cloud_stats["total_output_tokens"] / 1_000_000) * 75
-    cache_read_cost = (cloud_stats["total_cache_read_tokens"] / 1_000_000) * 1.50
-    cache_create_cost = (cloud_stats["total_cache_creation_tokens"] / 1_000_000) * 18.75  # 25% more than input
-    cloud_stats["estimated_cost_usd"] = round(input_cost + output_cost + cache_read_cost + cache_create_cost, 4)
+    # Estimated cost via the shared per-model pricing table (estimate — see /cost)
+    cloud_stats["estimated_cost_usd"] = round(estimate_cost(
+        cloud_stats.get("model", ""),
+        cloud_stats["total_input_tokens"],
+        cloud_stats["total_output_tokens"],
+        cloud_stats["total_cache_creation_tokens"],
+        cloud_stats["total_cache_read_tokens"],
+    ), 4)
 
     return {"cloud_stats": cloud_stats, "payload_summary": payload_summary}
 
@@ -729,6 +858,7 @@ def build_session_data(main_file: Path, agent_files: list[Path]) -> dict:
         "prompt": "",
         "trace": main_trace,
         "tool_calls": [t for t in main_trace if t["type"] == "tool_use"],
+        "tokens": aggregate_tokens(main_entries),
     }
 
     agents = [main_agent]
@@ -800,6 +930,7 @@ def build_session_data(main_file: Path, agent_files: list[Path]) -> dict:
             "prompt": first_prompt,
             "trace": agent_trace,
             "tool_calls": [t for t in agent_trace if t["type"] == "tool_use"],
+            "tokens": aggregate_tokens(agent_entries),
         }
 
         agents.append(agent_data)
@@ -902,13 +1033,15 @@ def build_session_data(main_file: Path, agent_files: list[Path]) -> dict:
         cloud_data["cloud_stats"]["message_ids"].extend(agent_cloud["cloud_stats"]["message_ids"])
         cloud_data["payload_summary"]["total_content_chars"] += agent_cloud["payload_summary"]["total_content_chars"]
 
-    # Recalculate cost with agent data included
+    # Recalculate cost with agent data included (per-model pricing)
     cs = cloud_data["cloud_stats"]
-    input_cost = (cs["total_input_tokens"] / 1_000_000) * 15
-    output_cost = (cs["total_output_tokens"] / 1_000_000) * 75
-    cache_read_cost = (cs["total_cache_read_tokens"] / 1_000_000) * 1.50
-    cache_create_cost = (cs["total_cache_creation_tokens"] / 1_000_000) * 18.75
-    cs["estimated_cost_usd"] = round(input_cost + output_cost + cache_read_cost + cache_create_cost, 4)
+    cs["estimated_cost_usd"] = round(estimate_cost(
+        cs.get("model", ""),
+        cs["total_input_tokens"],
+        cs["total_output_tokens"],
+        cs["total_cache_creation_tokens"],
+        cs["total_cache_read_tokens"],
+    ), 4)
     cs["api_requests"] = len(set(cs["request_ids"]))
 
     return {
@@ -930,6 +1063,7 @@ def build_session_data(main_file: Path, agent_files: list[Path]) -> dict:
             "total_tool_calls": sum(len(a["tool_calls"]) for a in agents),
             "event_counts": event_counts,
             "tools_by_agent": {a["id"]: len(a["tool_calls"]) for a in agents},
+            "tokens": combine_token_aggregates([a["tokens"] for a in agents]),
         }
     }
 
@@ -1353,6 +1487,14 @@ def generate_html(data: dict, all_sessions: list[dict] = None) -> str:
                 <div class="stat-value">{lifecycle_count}</div>
                 <div class="stat-label">Lifecycle</div>
             </div>
+            <div class="stat">
+                <div class="stat-value">{total_tokens_fmt}</div>
+                <div class="stat-label">Tokens (est)</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{est_cost_fmt}</div>
+                <div class="stat-label">Est. cost</div>
+            </div>
         </div>
 
         <div class="cloud-section">
@@ -1769,7 +1911,7 @@ def generate_html(data: dict, all_sessions: list[dict] = None) -> str:
     # Calculate lifecycle count (lifecycle + post_tool_use events)
     lifecycle_count = event_counts.get("lifecycle", 0) + event_counts.get("post_tool_use", 0)
 
-    # Extract cloud stats
+    # Extract cloud stats (Payload tab: what was transmitted to the API)
     cloud_stats = data.get("cloud_stats", {})
     payload_summary = data.get("payload_summary", {})
 
@@ -1785,11 +1927,17 @@ def generate_html(data: dict, all_sessions: list[dict] = None) -> str:
     model = cloud_stats.get("model", "unknown") or "unknown"
     model_short = model.split("-")[-1] if model != "unknown" else "N/A"
     if "opus" in model.lower():
-        model_short = "Opus 4.5"
+        model_short = "Opus"
     elif "sonnet" in model.lower():
         model_short = "Sonnet"
     elif "haiku" in model.lower():
         model_short = "Haiku"
+
+    # Token & cost summary (estimate — per-model pricing, see estimate_cost)
+    tokens_stats = data["stats"].get("tokens") or {}
+    total_tokens_val = tokens_stats.get("total_tokens", 0)
+    total_tokens_fmt = f"{total_tokens_val / 1000:.1f}K" if total_tokens_val else "0"
+    est_cost_fmt = f"${tokens_stats.get('cost', 0):.2f}"
 
     return html_template.format(
         session_id_short=session_id_short,
@@ -1802,6 +1950,8 @@ def generate_html(data: dict, all_sessions: list[dict] = None) -> str:
         thinking_count=event_counts.get("thinking", 0),
         text_count=event_counts.get("text", 0),
         lifecycle_count=lifecycle_count,
+        total_tokens_fmt=total_tokens_fmt,
+        est_cost_fmt=est_cost_fmt,
         json_str=json_str,
         sessions_json=sessions_json,
         model_short=model_short,
@@ -1833,7 +1983,7 @@ def generate_digest(data: dict) -> str:
     lines.append(f"**Agents:** {stats.get('total_agents', 0)} ({', '.join(a['type'] for a in agents[:5])})")
     lines.append("")
 
-    # Cloud transmission summary
+    # Cloud transmission summary (payload / what was sent to the API)
     cloud_stats = data.get("cloud_stats", {})
     payload_summary = data.get("payload_summary", {})
     if cloud_stats.get("model"):
@@ -1848,6 +1998,40 @@ def generate_digest(data: dict) -> str:
         files_sent = payload_summary.get("files_sent", [])
         total_chars = payload_summary.get("total_content_chars", 0)
         lines.append(f"- **Files Sent:** {len(files_sent)} files ({total_chars:,} chars)")
+        lines.append("")
+
+    # Token & cost accounting (estimate — run /cost for authoritative billing)
+    tokens = stats.get("tokens") or {}
+    if tokens.get("total_tokens"):
+        t = tokens["totals"]
+        lines.append("## Token & Cost (estimate)")
+        lines.append("")
+        lines.append(
+            f"**Total tokens:** {tokens['total_tokens']:,} "
+            f"(in {t['input_tokens']:,} · out {t['output_tokens']:,} · "
+            f"cache-write {t['cache_creation_input_tokens']:,} · "
+            f"cache-read {t['cache_read_input_tokens']:,})")
+        lines.append(
+            f"**Estimated cost:** ${tokens['cost']:.4f} "
+            f"(estimate — run /cost or the Usage & Cost API for authoritative billing)")
+        if tokens.get("per_model"):
+            parts = []
+            for model, pm in sorted(tokens["per_model"].items(),
+                                    key=lambda kv: kv[1]["cost"], reverse=True):
+                mt = sum(pm[k] for k in _TOKEN_FIELDS)
+                parts.append(f"{model} ({mt:,} tok, ${pm['cost']:.4f})")
+            lines.append(f"**By model:** {', '.join(parts)}")
+        agent_lines = []
+        for a in agents:
+            atok = a.get("tokens") or {}
+            if atok.get("total_tokens"):
+                label = "orchestrator" if a["id"] == "main" else f"{a.get('type', '')}:{a['id'][:8]}"
+                agent_lines.append(
+                    f"- {label}: {atok['total_tokens']:,} tok, ${atok['cost']:.4f}")
+        if len(agent_lines) > 1:
+            lines.append("")
+            lines.append("**By agent:**")
+            lines.extend(agent_lines)
         lines.append("")
 
     # User prompts
@@ -1960,25 +2144,32 @@ def format_session_list(sessions: list[dict]) -> str:
         return "No sessions found."
 
     lines = []
-    lines.append(f"{'ID':<12} {'Duration':>8}  {'Project':<30} {'Summary'}")
-    lines.append("-" * 100)
+    lines.append(f"{'ID':<12} {'Dur':>6} {'Tokens':>9} {'Est.$':>8}  {'Project':<26} {'Summary'}")
+    lines.append("-" * 110)
 
     for s in sessions:
         sid = s["id"][:8]  # Short ID is enough to identify
         duration = f"{s['duration_mins']}m" if s["duration_mins"] else "?"
+        total_tokens = s.get("total_tokens", 0) or 0
+        tok_str = f"{total_tokens / 1000:.1f}K" if total_tokens else "-"
+        cost = s.get("cost", 0) or 0
+        cost_str = f"${cost:.2f}" if cost else "-"
         project = s.get("project", "")
         # Shorten project path
         if project:
             project = project.replace(str(Path.home()), "~")
-            if len(project) > 28:
-                project = "..." + project[-25:]
+            if len(project) > 24:
+                project = "..." + project[-21:]
         else:
             project = "(unknown)"
         summary = s["summary"][:40] + "..." if len(s["summary"]) > 40 else s["summary"]
         if not summary:
             summary = "(no summary)"
-        lines.append(f"{sid:<12} {duration:>8}  {project:<30} {summary}")
+        lines.append(f"{sid:<12} {duration:>6} {tok_str:>9} {cost_str:>8}  {project:<26} {summary}")
 
+    lines.append("")
+    lines.append("Tokens/Est.$ are the orchestrator transcript only (estimate). "
+                 "Run `--digest` for the full per-agent breakdown, or /cost for authoritative billing.")
     return "\n".join(lines)
 
 

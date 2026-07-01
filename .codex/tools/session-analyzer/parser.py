@@ -13,6 +13,20 @@ import uuid
 DEFAULT_CODEX_HOME = os.path.expanduser("~/.codex")
 DEFAULT_SESSIONS_DIR = os.path.join(DEFAULT_CODEX_HOME, "sessions")
 
+# Estimated per-1M-token USD prices — UPDATE as OpenAI pricing changes; these are ESTIMATES.
+# Sourced from public OpenAI/Codex pricing pages (confirmed 2026-07 for gpt-5.2-codex:
+# $1.75 input / $0.175 cached input / $14.00 output per 1M tokens). Cached input is
+# billed cheaper than fresh input; reasoning_output_tokens are billed at the output rate.
+# NOTE: gpt-5-codex cached_input is a best-guess estimate (~10% of input) and should be
+# verified against the current OpenAI rate card before relying on these numbers.
+PRICING_USD_PER_MTOK = {
+    "gpt-5.2-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
+    "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
+    "gpt-5-codex": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
+    # Fallback for unknown/unlisted models — mirrors gpt-5.2-codex (the config.toml default).
+    "default": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
+}
+
 SKIP_SUBSTRINGS = [
     "<environment_context>",
     "agents.md",
@@ -212,6 +226,62 @@ def summarize_token_count(payload):
     return f"token_count {suffix}".strip() if suffix else "token_count"
 
 
+def estimate_cost(model, total_usage):
+    """Estimate USD cost from a session's final total_token_usage.
+
+    Looks the model up in PRICING_USD_PER_MTOK (falling back to "default"), then:
+        cost = input_tokens * input_rate
+             + cached_input_tokens * cached_rate
+             + (output_tokens + reasoning_output_tokens) * output_rate
+    all divided by 1e6. cached_input_tokens and input_tokens are treated as distinct
+    billing buckets here. Returns None when usage is empty/unavailable. This is an
+    ESTIMATE only and is deliberately defensive — it never raises.
+    """
+    try:
+        usage = total_usage if isinstance(total_usage, dict) else {}
+        if not usage:
+            return None
+
+        def _num(key):
+            value = usage.get(key)
+            return value if isinstance(value, (int, float)) else 0
+
+        input_tokens = _num("input_tokens")
+        cached_input_tokens = _num("cached_input_tokens")
+        output_tokens = _num("output_tokens")
+        reasoning_output_tokens = _num("reasoning_output_tokens")
+
+        if not any(
+            [input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens]
+        ):
+            return None
+
+        rates = (
+            PRICING_USD_PER_MTOK.get(model)
+            or PRICING_USD_PER_MTOK.get("default")
+            or {}
+        )
+        input_rate = rates.get("input", 0)
+        cached_rate = rates.get("cached_input", 0)
+        output_rate = rates.get("output", 0)
+
+        cost = (
+            input_tokens * input_rate
+            + cached_input_tokens * cached_rate
+            + (output_tokens + reasoning_output_tokens) * output_rate
+        ) / 1_000_000.0
+        return cost
+    except Exception:
+        return None
+
+
+def format_cost_usd(cost):
+    """Format an estimated cost as a short USD string, or '-' when unknown."""
+    if cost is None:
+        return "-"
+    return f"${cost:.4f}"
+
+
 def format_session_meta(payload):
     if not isinstance(payload, dict):
         return ""
@@ -288,6 +358,9 @@ def summarize_tool_args(args):
 def summarize_tool_output(output):
     if not output:
         return ""
+    # Real session data sometimes carries `output` as a list/dict, not a string.
+    if not isinstance(output, str):
+        output = stringify_details(output)
     exit_match = re.search(r"Exit code:\s*(\d+)", output)
     exit_code = exit_match.group(1) if exit_match else None
     first_line = ""
@@ -309,6 +382,8 @@ def summarize_tool_output(output):
 def tool_output_error(output):
     if not output:
         return False
+    if not isinstance(output, str):
+        output = stringify_details(output)
     match = re.search(r"Exit code:\s*(\d+)", output)
     if match:
         return match.group(1) != "0"
@@ -324,6 +399,7 @@ def parse_session(path, max_chars=0, include_raw=False):
     last_ts = None
     model = None
     cli_version = None
+    token_usage = None
     events = []
     index = 0
 
@@ -562,6 +638,12 @@ def parse_session(path, max_chars=0, include_raw=False):
                         event_type=EVENT_THINKING,
                     )
                 elif event_type_payload == "token_count":
+                    # token_count events report cumulative totals; keep the latest as
+                    # the session's final usage for cost estimation.
+                    info = payload.get("info") or {}
+                    total_usage = info.get("total_token_usage")
+                    if isinstance(total_usage, dict) and total_usage:
+                        token_usage = total_usage
                     details = format_token_count(payload)
                     details = truncate_text(details, max_chars)
                     summary = summarize_token_count(payload)
@@ -610,6 +692,8 @@ def parse_session(path, max_chars=0, include_raw=False):
         "tool_counts": tool_counts,
         "model": model,
         "cli_version": cli_version,
+        "token_usage": token_usage,
+        "estimated_cost": estimate_cost(model, token_usage),
         "summary": summarize_text(first_non_instruction(user_messages)),
         "events": events_sorted,
         "counts_by_category": counts_by_category,
@@ -645,14 +729,18 @@ def print_list(sessions, limit=None):
     sessions = sorted(sessions, key=lambda s: s["start_ts"] or dt.datetime.min, reverse=True)
     if limit:
         sessions = sessions[:limit]
-    print("ID        Duration  Project                        Summary")
-    print("-" * 90)
+    print("ID        Duration   Est.Cost  Project                        Summary")
+    print("-" * 100)
     for session in sessions:
         sid = (session["id"] or "")[:8]
         duration = session["duration"]
         project = session["cwd"] or "(unknown)"
         summary = session["summary"]
-        print(f"{sid:<10}{duration:>8}  {project:<30}  {summary}")
+        cost = session.get("estimated_cost")
+        if cost is None:
+            cost = estimate_cost(session.get("model"), session.get("token_usage"))
+        cost_str = format_cost_usd(cost)  # ESTIMATE — see /cost for authoritative billing
+        print(f"{sid:<10}{duration:>8}  {cost_str:>9}  {project:<30}  {summary}")
 
 
 def generate_digest(session):
@@ -670,6 +758,14 @@ def generate_digest(session):
     lines.append(f"**Duration:** {session['duration']}")
     if session["model"]:
         lines.append(f"**Model:** {session['model']}")
+    cost = session.get("estimated_cost")
+    if cost is None:
+        cost = estimate_cost(session.get("model"), session.get("token_usage"))
+    if cost is not None:
+        lines.append(
+            f"**Estimated cost:** {format_cost_usd(cost)} "
+            "(estimate — see /cost or provider billing for authoritative)"
+        )
     lines.append("")
 
     # User prompts (filter out instruction messages)

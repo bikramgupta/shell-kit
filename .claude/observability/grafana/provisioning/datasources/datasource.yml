@@ -1,0 +1,13 @@
+# Grafana datasource provisioning: Prometheus (default).
+# Fixed uid so the bundled dashboard can reference it directly.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
