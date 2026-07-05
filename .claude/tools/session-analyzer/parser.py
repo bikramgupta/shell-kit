@@ -173,15 +173,42 @@ def find_projects_dir() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+def find_agent_files(project_dir: Path, main_file: Path) -> list[Path]:
+    """Find subagent transcripts belonging to a session.
+
+    New layout (nested, per-session): <project>/<session-id>/subagents/agent-*.jsonl,
+    with workflow-spawned agents one level deeper under
+    subagents/workflows/<run-id>/agent-*.jsonl.
+    Legacy layout: flat agent-*.jsonl files next to the main transcript.
+    """
+    agent_files = list(project_dir.glob("agent-*.jsonl"))  # legacy flat layout
+    subagents_dir = project_dir / main_file.stem / "subagents"
+    if subagents_dir.is_dir():
+        agent_files.extend(subagents_dir.glob("agent-*.jsonl"))
+        agent_files.extend(subagents_dir.glob("workflows/*/agent-*.jsonl"))
+    return sorted(agent_files, key=lambda f: f.stat().st_mtime)
+
+
 def find_session_files(session_id: Optional[str] = None,
                        project_path: Optional[str] = None,
                        latest: bool = False) -> tuple[Path, list[Path]]:
     """
     Find main session file and associated agent files.
 
+    session_id may also be a filesystem path: either a transcript .jsonl or a
+    per-session directory (<project>/<session-id>/) — used directly, no search.
+
     Returns:
         (main_transcript, list_of_agent_transcripts)
     """
+    if session_id:
+        p = Path(session_id).expanduser()
+        if p.is_dir() and p.with_suffix(".jsonl").is_file():
+            p = p.with_suffix(".jsonl")  # per-session dir → sibling transcript
+        if p.suffix == ".jsonl" and p.is_file():
+            p = p.resolve()
+            return p, find_agent_files(p.parent, p)
+
     projects_dir = find_projects_dir()
     project_dir = None
 
@@ -253,12 +280,8 @@ def find_session_files(session_id: Optional[str] = None,
     else:
         main_file = session_files[0]  # Default to latest
 
-    # Find associated agent files (by modification time proximity)
-    main_mtime = main_file.stat().st_mtime
-    agent_files = sorted(
-        project_dir.glob("agent-*.jsonl"),
-        key=lambda f: f.stat().st_mtime
-    )
+    # Find associated agent files (nested per-session layout + legacy flat)
+    agent_files = find_agent_files(project_dir, main_file)
 
     return main_file, agent_files
 
@@ -2247,9 +2270,209 @@ def format_payload(data: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Session overview (topology)
+#
+# One entry point that shows everything a session left on disk:
+#   <project>/<sid>.jsonl                      main transcript
+#   <project>/<sid>/subagents/agent-*.jsonl    direct sub-agents (Agent tool)
+#   <project>/<sid>/workflows/wf_*.json        dynamic workflow run snapshots
+#   <project>/<sid>/subagents/workflows/<run>/ workflow agent transcripts + journal
+#   <project>/<sid>/tool-results/              large tool outputs offloaded from context
+#
+# Token usage is NOT rolled up into the main transcript: the main file's Task
+# tool result records only agentId/status. Each sub-agent's usage lives in its
+# own transcript, so totals here aggregate across all of them.
+# ---------------------------------------------------------------------------
+
+def build_overview(main_file: Path) -> dict:
+    """Build the session topology overview (see block comment above)."""
+    project_dir = main_file.parent
+    session_dir = project_dir / main_file.stem
+    subagents_dir = session_dir / "subagents"
+    workflows_dir = session_dir / "workflows"
+    tool_results_dir = session_dir / "tool-results"
+
+    main_entries = parse_jsonl(main_file)
+    main_tokens = aggregate_tokens(main_entries)
+    api_requests = sum(1 for e in main_entries if extract_usage(e))
+    main_model = max(main_tokens["per_model"],
+                     key=lambda m: sum(main_tokens["per_model"][m][k] for k in _TOKEN_FIELDS),
+                     default="unknown")
+
+    # Map agentId -> Task description (recorded in the main transcript's tool results)
+    agent_desc = {}
+    for e in main_entries:
+        tur = e.get("toolUseResult")
+        if isinstance(tur, dict) and tur.get("agentId"):
+            agent_desc[tur["agentId"]] = tur.get("description") or ""
+
+    aggs = [main_tokens]
+
+    # Direct sub-agents (Agent tool). Workflow agents live one level deeper
+    # and are attributed to their workflow run below, not double-counted here.
+    subagents = []
+    warmup_skipped = 0
+    direct_files = sorted(subagents_dir.glob("agent-*.jsonl"),
+                          key=lambda f: f.stat().st_mtime) if subagents_dir.is_dir() else []
+    for f in direct_files:
+        entries = parse_jsonl(f)
+        if not entries:
+            continue
+        if is_warmup_agent(entries):
+            warmup_skipped += 1
+            continue
+        agg = aggregate_tokens(entries)
+        aggs.append(agg)
+        agent_id = f.stem.replace("agent-", "", 1)
+        agent_type = None
+        meta_file = f.with_name(f"{f.stem}.meta.json")
+        if meta_file.is_file():
+            try:
+                agent_type = json.loads(meta_file.read_text()).get("agentType")
+            except (json.JSONDecodeError, OSError):
+                pass
+        subagents.append({
+            "id": agent_id,
+            "agent_type": agent_type or "subagent",
+            "description": agent_desc.get(agent_id, ""),
+            "path": str(f),
+            "total_tokens": agg["total_tokens"],
+            "cost": agg["cost"],
+        })
+
+    # Dynamic workflow runs (wf_*.json snapshots + their agent transcripts)
+    workflows = []
+    wf_files = sorted(workflows_dir.glob("wf_*.json"),
+                      key=lambda f: f.stat().st_mtime) if workflows_dir.is_dir() else []
+    for wf_json in wf_files:
+        try:
+            wf = json.loads(wf_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        run_id = wf.get("runId") or wf_json.stem
+        wf_agents_dir = subagents_dir / "workflows" / run_id
+        transcripts = sorted(wf_agents_dir.glob("agent-*.jsonl")) if wf_agents_dir.is_dir() else []
+        wf_aggs = []
+        for t in transcripts:
+            entries = parse_jsonl(t)
+            if entries and not is_warmup_agent(entries):
+                wf_aggs.append(aggregate_tokens(entries))
+        wf_agg = combine_token_aggregates(wf_aggs) if wf_aggs else None
+        if wf_agg:
+            aggs.append(wf_agg)
+        workflows.append({
+            "run_id": run_id,
+            "name": wf.get("workflowName", ""),
+            "status": wf.get("status", ""),
+            "agent_count": wf.get("agentCount", 0),
+            "reported_tokens": wf.get("totalTokens", 0),
+            "duration_ms": wf.get("durationMs"),
+            "snapshot": str(wf_json),
+            "script": wf.get("scriptPath") or "",
+            "agents_dir": str(wf_agents_dir) if transcripts else "",
+            "transcript_count": len(transcripts),
+            "transcript_tokens": wf_agg["total_tokens"] if wf_agg else 0,
+            "cost": wf_agg["cost"] if wf_agg else 0.0,
+        })
+
+    tool_result_files = (sorted(f.name for f in tool_results_dir.iterdir() if f.is_file())
+                         if tool_results_dir.is_dir() else [])
+    combined = combine_token_aggregates(aggs)
+
+    return {
+        "session_id": main_file.stem,
+        "transcript": str(main_file),
+        "transcript_bytes": main_file.stat().st_size,
+        "session_dir": str(session_dir) if session_dir.is_dir() else None,
+        "main": {
+            "model": main_model,
+            "api_requests": api_requests,
+            "total_tokens": main_tokens["total_tokens"],
+            "cost": main_tokens["cost"],
+        },
+        "subagents": subagents,
+        "warmup_agents_skipped": warmup_skipped,
+        "workflows": workflows,
+        "tool_results_dir": str(tool_results_dir) if tool_result_files else None,
+        "tool_result_files": tool_result_files,
+        "session_total": {
+            "total_tokens": combined["total_tokens"],
+            "cost": combined["cost"],
+            "per_model": combined["per_model"],
+        },
+    }
+
+
+def _fmt_duration_ms(ms) -> str:
+    if ms is None:
+        return "-"
+    sec = ms / 1000
+    return f"{sec:.0f}s" if sec < 60 else f"{sec / 60:.1f}m"
+
+
+def format_overview(ov: dict) -> str:
+    """Format a build_overview() dict as readable text."""
+    lines = []
+    lines.append("SESSION OVERVIEW")
+    lines.append("=" * 60)
+    lines.append(f"Session:     {ov['session_id']}")
+    lines.append(f"Transcript:  {ov['transcript']}  ({ov['transcript_bytes'] / 1024:.0f} KB)")
+    lines.append(f"Session dir: {ov['session_dir'] or '(none yet — created on first sub-agent, workflow, or offloaded tool result)'}")
+    m = ov["main"]
+    lines.append(f"Main agent:  {m['model']} · {m['api_requests']} API requests · "
+                 f"{m['total_tokens']:,} tokens · est. ${m['cost']:.4f}")
+
+    if ov["subagents"]:
+        lines.append("")
+        lines.append(f"DIRECT SUB-AGENTS ({len(ov['subagents'])})")
+        lines.append("=" * 60)
+        for a in ov["subagents"]:
+            desc = f'  "{a["description"]}"' if a["description"] else ""
+            lines.append(f"  {a['id'][:12]}  {a['agent_type']} · "
+                         f"{a['total_tokens']:,} tokens · est. ${a['cost']:.4f}{desc}")
+            lines.append(f"      {a['path']}")
+
+    if ov["workflows"]:
+        lines.append("")
+        lines.append(f"DYNAMIC WORKFLOWS ({len(ov['workflows'])})")
+        lines.append("=" * 60)
+        for w in ov["workflows"]:
+            lines.append(f"  {w['run_id']}  {w['name']}  [{w['status']}]  "
+                         f"{w['agent_count']} agents · {w['reported_tokens']:,} tokens (reported) · "
+                         f"{_fmt_duration_ms(w['duration_ms'])}")
+            lines.append(f"      snapshot:  {w['snapshot']}")
+            if w["script"]:
+                lines.append(f"      script:    {w['script']}")
+            if w["agents_dir"]:
+                lines.append(f"      agents:    {w['agents_dir']}  "
+                             f"({w['transcript_count']} transcripts · "
+                             f"{w['transcript_tokens']:,} tokens · est. ${w['cost']:.4f})")
+            lines.append(f"      describe:  claude-workflow-analyzer '{w['snapshot']}'")
+
+    if ov["tool_result_files"]:
+        lines.append("")
+        lines.append(f"OFFLOADED TOOL RESULTS ({len(ov['tool_result_files'])})")
+        lines.append("=" * 60)
+        lines.append(f"  {ov['tool_results_dir']}")
+
+    t = ov["session_total"]
+    lines.append("")
+    lines.append("SESSION TOTAL (main + sub-agents + workflow agents)")
+    lines.append("=" * 60)
+    lines.append(f"  {t['total_tokens']:,} tokens · est. ${t['cost']:.4f}")
+    for model, pm in sorted(t["per_model"].items(), key=lambda kv: -kv[1]["cost"]):
+        toks = sum(pm[k] for k in _TOKEN_FIELDS)
+        lines.append(f"    {model}: {toks:,} tokens · est. ${pm['cost']:.4f}")
+    lines.append("  (cost is an estimate — /cost and the Usage API are authoritative)")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Claude Code Session Analyzer")
-    parser.add_argument("session_id", nargs="?", help="Session ID to analyze")
+    parser.add_argument("session_id", nargs="?",
+                        help="Session ID, or path to a transcript .jsonl / per-session directory")
     parser.add_argument("--latest", action="store_true", help="Analyze most recent session")
     parser.add_argument("--list", action="store_true", help="List all sessions with summaries")
     parser.add_argument("--project", help="Project path to search in")
@@ -2263,8 +2486,42 @@ def main():
                         help="Show what content was sent to the cloud (files, prompts)")
     parser.add_argument("--open", action="store_true", help="Open HTML in browser")
     parser.add_argument("--out-file", help="Write output to file instead of stdout")
+    parser.add_argument("--path", action="store_true",
+                        help="Print only the resolved transcript file path and exit")
+    parser.add_argument("--overview", action="store_true",
+                        help="Show session topology: transcript, sub-agents, "
+                             "workflows, offloaded tool results, token totals")
 
     args = parser.parse_args()
+
+    # Handle --path flag: resolve and print the transcript path only (fast, no parsing)
+    if args.path:
+        try:
+            main_file, _ = find_session_files(
+                session_id=args.session_id,
+                project_path=args.project,
+                latest=args.latest or (not args.session_id)
+            )
+            print(main_file)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --overview flag: session topology (main + sub-agents + workflows)
+    if args.overview:
+        try:
+            main_file, _ = find_session_files(
+                session_id=args.session_id,
+                project_path=args.project,
+                latest=args.latest or (not args.session_id)
+            )
+            ov = build_overview(main_file)
+            print(json.dumps(ov, indent=2) if args.output == "json" else format_overview(ov))
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     # Handle --list flag
     if args.list:

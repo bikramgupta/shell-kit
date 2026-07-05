@@ -5,10 +5,13 @@
 #   claude-session-analyzer                    # Analyze latest session in current project
 #   claude-session-analyzer --latest           # Same as above
 #   claude-session-analyzer <session-id>       # Analyze specific session
+#   claude-session-analyzer <path/to.jsonl>    # Analyze a transcript by path
 #   claude-session-analyzer --project /path    # Analyze sessions in specific project
 #   claude-session-analyzer --output json      # Output JSON instead of HTML
 #   claude-session-analyzer --open             # Open HTML in browser
 #   claude-session-analyzer --list             # List all sessions with summaries
+#   claude-session-analyzer --latest --path    # Print current session transcript path only
+#   claude-session-analyzer <id> --overview    # Session topology: sub-agents, workflows, totals
 #
 # Examples:
 #   claude-session-analyzer --latest --open

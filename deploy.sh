@@ -320,15 +320,21 @@ deploy_claude_settings() {
     # Ensure scripts are executable
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/analyze.sh" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
+    chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/workflow.py" 2>/dev/null || true
     echo -e "  ${GREEN}Deployed:${NC} ~/.claude/tools/"
   fi
 
-  # Create symlink for session-analyzer CLI
+  # Create symlinks for session-analyzer + workflow-analyzer CLIs
   mkdir -p "$HOME/.local/bin"
   local analyzer="$HOME_CLAUDE_DIR/tools/session-analyzer/analyze.sh"
   if [[ -f "$analyzer" ]]; then
     ln -sf "$analyzer" "$HOME/.local/bin/claude-session-analyzer"
     echo -e "  ${GREEN}Symlinked:${NC} claude-session-analyzer -> ~/.local/bin/"
+  fi
+  local wf_analyzer="$HOME_CLAUDE_DIR/tools/session-analyzer/workflow.py"
+  if [[ -f "$wf_analyzer" ]]; then
+    ln -sf "$wf_analyzer" "$HOME/.local/bin/claude-workflow-analyzer"
+    echo -e "  ${GREEN}Symlinked:${NC} claude-workflow-analyzer -> ~/.local/bin/"
   fi
 
   echo ""
@@ -464,5 +470,6 @@ echo "  ghelp                    - Git commands"
 echo "  dkhelp                   - Docker commands"
 echo "  hunt -h                  - Search commands"
 echo "  claude-session-analyzer  - Analyze Claude sessions (tokens + cost)"
+echo "  claude-workflow-analyzer - Describe dynamic workflow runs (wf_*.json)"
 echo "  codex-session-analyzer   - Analyze Codex sessions (tokens + cost)"
 echo "  claude-telemetry help    - Local OTEL + Grafana stack (cc-obs)"

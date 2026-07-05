@@ -73,6 +73,7 @@ docs/
 - `dkhelp` - Docker command reference
 - `hunt -h` - Search command help
 - `claude-session-analyzer --help` - Claude session analysis tool
+- `claude-workflow-analyzer --help` - Describe dynamic workflow runs (wf_*.json)
 - `codex-session-analyzer --help` - Codex session analysis tool
 - `claude-telemetry help` - Grafana/OTEL observability stack control (`cc-obs` alias)
 
@@ -115,6 +116,9 @@ myproject/
 - `claude-session-analyzer --list` - List all sessions
 - `claude-session-analyzer --latest --open` - View latest session trace
 - `claude-session-analyzer --latest --digest` - Markdown digest for session continuation
+- `claude-session-analyzer <id> --overview` - Session topology: sub-agents, workflows, totals
+- `claude-workflow-analyzer` - List/describe dynamic workflow runs (works outside sessions)
+- `/session-stats` (in-session) - Current session's transcript path + topology overview
 
 **Codex tools:**
 - `codex-session-analyzer --list` - List all sessions

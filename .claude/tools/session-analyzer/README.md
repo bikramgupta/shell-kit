@@ -25,6 +25,9 @@ claude-session-analyzer --latest --open
 # Analyze specific session (searches globally if not found locally)
 claude-session-analyzer bf5793b6 --open
 
+# Analyze by path — transcript .jsonl or per-session directory, any project
+claude-session-analyzer ~/.claude/projects/<proj>/<session-id>.jsonl --overview
+
 # Output JSON instead of HTML
 claude-session-analyzer --output json
 
@@ -36,6 +39,39 @@ claude-session-analyzer 29108e9c --digest > session-digest.md
 
 # Analyze sessions in a specific project
 claude-session-analyzer --project /path/to/project --list
+
+# Print just the transcript path (fast, no parsing)
+claude-session-analyzer <session-id> --path
+
+# Session topology: sub-agents, dynamic workflows, offloaded tool results, totals
+claude-session-analyzer <session-id> --overview
+```
+
+### Overview Output
+
+The `--overview` flag prints the full on-disk topology of a session:
+
+- **Main agent** - model, API request count, tokens, estimated cost
+- **Direct sub-agents** - one line per Agent-tool sub-agent (type, tokens, cost,
+  task description, transcript path)
+- **Dynamic workflows** - one block per Workflow run (status, agent count,
+  reported tokens, duration, snapshot/script/agents-dir paths)
+- **Offloaded tool results** - large tool outputs stored outside the transcript
+- **Session total** - main + sub-agents + workflow agents, per-model breakdown
+
+Inside a session, the `/session-stats` command wraps this (pinned to
+`$CLAUDE_CODE_SESSION_ID`, so it is correct with concurrent sessions).
+
+## Workflow Analyzer (companion tool)
+
+`workflow.py` (symlinked as `claude-workflow-analyzer`) describes dynamic
+workflow runs from the shell, outside any session:
+
+```bash
+claude-workflow-analyzer                    # List all runs across all projects
+claude-workflow-analyzer wf_9e75b43c-855    # Describe a run by id
+claude-workflow-analyzer --latest --agents  # Newest run, with per-agent table
+claude-workflow-analyzer --latest --samples # One sample agent per phase
 ```
 
 ### Digest Output
@@ -96,8 +132,30 @@ Hook logs are discovered by matching timestamps with the session time window. If
 ## How It Works
 
 1. **Transcript Location**: `~/.claude/projects/{encoded-path}/{sessionId}.jsonl`
-2. **Agent Transcripts**: Separate `agent-{agentId}.jsonl` files for each subagent
-3. **Path Encoding**: Both `/` and `.` are replaced with `-`
+2. **Path Encoding**: Both `/` and `.` are replaced with `-`
+3. **Per-session directory** (`{encoded-path}/{sessionId}/`, created on demand):
+
+```
+{sessionId}/
+├── subagents/
+│   ├── agent-{agentId}.jsonl        # Direct sub-agent transcripts (Agent tool)
+│   ├── agent-{agentId}.meta.json    # {agentType, spawnDepth}
+│   └── workflows/{runId}/           # Workflow-spawned agent transcripts
+│       ├── agent-{agentId}.jsonl
+│       └── journal.jsonl            # Workflow journal (started/result events)
+├── workflows/
+│   ├── wf_{runId}.json              # Workflow run snapshot (script, result, progress)
+│   └── scripts/{name}-{runId}.js    # Persisted workflow scripts
+└── tool-results/toolu_*.txt         # Large tool outputs offloaded from context
+```
+
+Older Claude Code versions wrote flat `agent-*.jsonl` files next to the main
+transcript; both layouts are supported.
+
+**Token accounting**: the main transcript's Task tool result records only the
+`agentId` — token usage is never rolled up into the main file. Each sub-agent's
+usage lives in its own transcript, which is why the analyzer aggregates across
+all of them.
 
 The analyzer:
 1. Finds the main session transcript
@@ -114,6 +172,7 @@ The analyzer:
 ~/.claude/tools/session-analyzer/
 ├── analyze.sh      # CLI entry point (handles symlinks)
 ├── parser.py       # Core parsing and HTML generation
+├── workflow.py     # claude-workflow-analyzer: describe wf_*.json workflow runs
 ├── templates/      # (reserved for future templates)
 └── README.md       # This file
 ```
