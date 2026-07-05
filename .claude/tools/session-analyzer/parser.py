@@ -19,6 +19,7 @@ import json
 import argparse
 import sys
 import re
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -2285,6 +2286,37 @@ def format_payload(data: dict) -> str:
 # own transcript, so totals here aggregate across all of them.
 # ---------------------------------------------------------------------------
 
+def short_model(model: str) -> str:
+    """Collapse a model id ('claude-opus-4-8[1m]') to its family ('opus')."""
+    m = (model or "").lower()
+    for family in ("opus", "sonnet", "haiku", "fable", "mythos"):
+        if family in m:
+            return family
+    return model or "unknown"
+
+
+def dominant_model(per_model: dict) -> str:
+    """The model that moved the most tokens in a per-model aggregate."""
+    if not per_model:
+        return "unknown"
+    return max(per_model,
+               key=lambda m: sum(per_model[m][k] for k in _TOKEN_FIELDS))
+
+
+def fmt_breakdown(totals: dict) -> str:
+    """Compact one-line in/out/cache split, e.g. 'in 43,083 · out 73,532 · …'."""
+    return (f"in {totals.get('input_tokens', 0):,} · "
+            f"out {totals.get('output_tokens', 0):,} · "
+            f"cache-w {totals.get('cache_creation_input_tokens', 0):,} · "
+            f"cache-r {totals.get('cache_read_input_tokens', 0):,}")
+
+
+def fmt_model_mix(counts: dict) -> str:
+    """Render a Counter of family->agent-count as '5× opus, 4× sonnet'."""
+    return ", ".join(f"{n}× {m}" for m, n in
+                     sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
 def build_overview(main_file: Path) -> dict:
     """Build the session topology overview (see block comment above)."""
     project_dir = main_file.parent
@@ -2337,6 +2369,8 @@ def build_overview(main_file: Path) -> dict:
             "agent_type": agent_type or "subagent",
             "description": agent_desc.get(agent_id, ""),
             "path": str(f),
+            "model": short_model(dominant_model(agg["per_model"])),
+            "totals": agg["totals"],
             "total_tokens": agg["total_tokens"],
             "cost": agg["cost"],
         })
@@ -2361,11 +2395,28 @@ def build_overview(main_file: Path) -> dict:
         wf_agg = combine_token_aggregates(wf_aggs) if wf_aggs else None
         if wf_agg:
             aggs.append(wf_agg)
+
+        # Agent model mix from the snapshot (authoritative for the script's
+        # per-agent model choices; transcripts only carry the resolved model).
+        prog_agents = [p for p in (wf.get("workflowProgress") or []) if p.get("label")]
+        model_mix = Counter(short_model(p.get("model")) for p in prog_agents)
+
+        # Per-model token sums across the workflow's agent transcripts.
+        per_model = {}
+        if wf_agg:
+            for model, pm in wf_agg["per_model"].items():
+                per_model[short_model(model)] = {
+                    "tokens": sum(pm[k] for k in _TOKEN_FIELDS),
+                    "cost": pm["cost"],
+                }
+
         workflows.append({
             "run_id": run_id,
             "name": wf.get("workflowName", ""),
             "status": wf.get("status", ""),
             "agent_count": wf.get("agentCount", 0),
+            "default_model": short_model(wf.get("defaultModel", "")),
+            "model_mix": dict(model_mix),
             "reported_tokens": wf.get("totalTokens", 0),
             "duration_ms": wf.get("durationMs"),
             "snapshot": str(wf_json),
@@ -2373,6 +2424,8 @@ def build_overview(main_file: Path) -> dict:
             "agents_dir": str(wf_agents_dir) if transcripts else "",
             "transcript_count": len(transcripts),
             "transcript_tokens": wf_agg["total_tokens"] if wf_agg else 0,
+            "totals": wf_agg["totals"] if wf_agg else {k: 0 for k in _TOKEN_FIELDS},
+            "per_model": per_model,
             "cost": wf_agg["cost"] if wf_agg else 0.0,
         })
 
@@ -2386,8 +2439,9 @@ def build_overview(main_file: Path) -> dict:
         "transcript_bytes": main_file.stat().st_size,
         "session_dir": str(session_dir) if session_dir.is_dir() else None,
         "main": {
-            "model": main_model,
+            "model": short_model(main_model),
             "api_requests": api_requests,
+            "totals": main_tokens["totals"],
             "total_tokens": main_tokens["total_tokens"],
             "cost": main_tokens["cost"],
         },
@@ -2398,6 +2452,7 @@ def build_overview(main_file: Path) -> dict:
         "tool_result_files": tool_result_files,
         "session_total": {
             "total_tokens": combined["total_tokens"],
+            "totals": combined["totals"],
             "cost": combined["cost"],
             "per_model": combined["per_model"],
         },
@@ -2422,6 +2477,7 @@ def format_overview(ov: dict) -> str:
     m = ov["main"]
     lines.append(f"Main agent:  {m['model']} · {m['api_requests']} API requests · "
                  f"{m['total_tokens']:,} tokens · est. ${m['cost']:.4f}")
+    lines.append(f"             {fmt_breakdown(m['totals'])}")
 
     if ov["subagents"]:
         lines.append("")
@@ -2429,8 +2485,9 @@ def format_overview(ov: dict) -> str:
         lines.append("=" * 60)
         for a in ov["subagents"]:
             desc = f'  "{a["description"]}"' if a["description"] else ""
-            lines.append(f"  {a['id'][:12]}  {a['agent_type']} · "
+            lines.append(f"  {a['id'][:12]}  {a['agent_type']} · {a.get('model', '?')} · "
                          f"{a['total_tokens']:,} tokens · est. ${a['cost']:.4f}{desc}")
+            lines.append(f"      {fmt_breakdown(a.get('totals', {}))}")
             lines.append(f"      {a['path']}")
 
     if ov["workflows"]:
@@ -2438,17 +2495,26 @@ def format_overview(ov: dict) -> str:
         lines.append(f"DYNAMIC WORKFLOWS ({len(ov['workflows'])})")
         lines.append("=" * 60)
         for w in ov["workflows"]:
+            mix = fmt_model_mix(w.get("model_mix", {})) or w.get("default_model", "?")
             lines.append(f"  {w['run_id']}  {w['name']}  [{w['status']}]  "
-                         f"{w['agent_count']} agents · {w['reported_tokens']:,} tokens (reported) · "
-                         f"{_fmt_duration_ms(w['duration_ms'])}")
+                         f"{w['agent_count']} agents · ran {_fmt_duration_ms(w['duration_ms'])}")
+            lines.append(f"      models:    {mix}")
+            lines.append(f"      reported:  {w['reported_tokens']:,} tokens "
+                         f"(orchestrator's own metric — excludes cached context)")
+            if w["agents_dir"]:
+                lines.append(f"      transcript:{w['transcript_tokens']:>10,} tokens "
+                             f"across {w['transcript_count']} agents · est. ${w['cost']:.4f}")
+                lines.append(f"                 {fmt_breakdown(w.get('totals', {}))}")
+                for model, pm in sorted(w.get("per_model", {}).items(),
+                                        key=lambda kv: -kv[1]["tokens"]):
+                    lines.append(f"                 {model}: {pm['tokens']:,} tokens · "
+                                 f"est. ${pm['cost']:.4f}")
             lines.append(f"      snapshot:  {w['snapshot']}")
             if w["script"]:
                 lines.append(f"      script:    {w['script']}")
             if w["agents_dir"]:
-                lines.append(f"      agents:    {w['agents_dir']}  "
-                             f"({w['transcript_count']} transcripts · "
-                             f"{w['transcript_tokens']:,} tokens · est. ${w['cost']:.4f})")
-            lines.append(f"      describe:  claude-workflow-analyzer '{w['snapshot']}'")
+                lines.append(f"      agents:    {w['agents_dir']}")
+            lines.append(f"      per-agent: claude-workflow-analyzer {w['run_id']} --agents")
 
     if ov["tool_result_files"]:
         lines.append("")
@@ -2461,10 +2527,17 @@ def format_overview(ov: dict) -> str:
     lines.append("SESSION TOTAL (main + sub-agents + workflow agents)")
     lines.append("=" * 60)
     lines.append(f"  {t['total_tokens']:,} tokens · est. ${t['cost']:.4f}")
+    lines.append(f"  {fmt_breakdown(t['totals'])}")
     for model, pm in sorted(t["per_model"].items(), key=lambda kv: -kv[1]["cost"]):
         toks = sum(pm[k] for k in _TOKEN_FIELDS)
-        lines.append(f"    {model}: {toks:,} tokens · est. ${pm['cost']:.4f}")
-    lines.append("  (cost is an estimate — /cost and the Usage API are authoritative)")
+        lines.append(f"    {short_model(model)}: {toks:,} tokens · est. ${pm['cost']:.4f} "
+                     f"({fmt_breakdown(pm)})")
+    lines.append("")
+    lines.append("  Legend: 'reported' = the workflow orchestrator's own per-agent metric; it")
+    lines.append("  excludes cached context, so it is far smaller. 'transcript' sums every usage")
+    lines.append("  field incl. cache — cache-r (context re-read each turn) usually dominates, so")
+    lines.append("  transcript ≫ reported. 'ran 8.6m' is wall-clock time, not tokens. Cost is an")
+    lines.append("  estimate — /cost and the Usage API are authoritative.")
 
     return "\n".join(lines)
 

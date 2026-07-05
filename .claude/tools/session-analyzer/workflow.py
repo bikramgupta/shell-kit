@@ -60,6 +60,47 @@ def agent_prefix(label: str) -> str:
     return label.split(":", 1)[0] if ":" in label else label
 
 
+_TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                 "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def transcript_breakdown(transcript: Path) -> dict:
+    """Sum in/out/cache tokens from one agent transcript (transcript-derived,
+    incl. cache — a different accounting than the snapshot's reported `tokens`)."""
+    totals = {k: 0 for k in _TOKEN_FIELDS}
+    try:
+        with transcript.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("type") != "assistant":
+                    continue
+                u = (e.get("message") or {}).get("usage") or e.get("usage") or {}
+                for k in _TOKEN_FIELDS:
+                    totals[k] += u.get(k) or 0
+    except OSError:
+        pass
+    totals["total"] = sum(totals[k] for k in _TOKEN_FIELDS)
+    return totals
+
+
+def breakdowns_by_agent_id(agents_dir: Path) -> dict:
+    """Map agentId -> transcript token breakdown for a workflow's agents dir.
+    Transcripts are named agent-<agentId>.jsonl next to their .meta.json."""
+    out = {}
+    if not agents_dir.is_dir():
+        return out
+    for t in agents_dir.glob("agent-*.jsonl"):
+        agent_id = t.stem.replace("agent-", "", 1)
+        out[agent_id] = transcript_breakdown(t)
+    return out
+
+
 def print_section(title: str) -> None:
     print()
     print(title)
@@ -206,15 +247,22 @@ def summarize_run(data: dict, path: Path, show_agents: bool, show_samples: bool)
                 print(f"    sum agent duration: {ms_to_min_sec(sum(durations))}")
 
         if show_agents:
+            bd = breakdowns_by_agent_id(
+                path.parent.parent / "subagents" / "workflows" / path.stem)
             print_section("AGENT TABLE")
-            print(f"  {'LABEL':<32} {'PHASE':<14} {'STATE':<8} "
-                  f"{'TOKENS':>10} {'TOOLS':>5} {'TIME':>7}  MODEL")
+            print("  REPORTED = orchestrator's own per-agent metric (excludes cached context).  "
+                  "IN/OUT/CACHE-* = transcript-derived (incl. cache).")
+            print(f"  {'LABEL':<26} {'PHASE':<10} {'REPORTED':>9} "
+                  f"{'IN':>7} {'OUT':>7} {'CACHE-W':>9} {'CACHE-R':>10} {'TIME':>7}  MODEL")
             for a in sorted(agents, key=lambda a: (a.get("phaseIndex") or 0, a.get("index") or 0)):
-                print(f"  {(a.get('label') or '?')[:32]:<32} "
-                      f"{(a.get('phaseTitle') or '?')[:14]:<14} "
-                      f"{(a.get('state') or '?'):<8} "
-                      f"{a.get('tokens') or 0:>10,} "
-                      f"{a.get('toolCalls') or 0:>5} "
+                t = bd.get(a.get("agentId"), {})
+                print(f"  {(a.get('label') or '?')[:26]:<26} "
+                      f"{(a.get('phaseTitle') or '?')[:10]:<10} "
+                      f"{a.get('tokens') or 0:>9,} "
+                      f"{t.get('input_tokens', 0):>7,} "
+                      f"{t.get('output_tokens', 0):>7,} "
+                      f"{t.get('cache_creation_input_tokens', 0):>9,} "
+                      f"{t.get('cache_read_input_tokens', 0):>10,} "
                       f"{ms_to_min_sec(a.get('durationMs')):>7}  "
                       f"{a.get('model') or '-'}")
 
