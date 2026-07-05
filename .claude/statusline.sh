@@ -8,11 +8,21 @@ USAGE=$(echo "$input" | jq '.context_window.current_usage')
 COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 CURRENT_DIR=$(echo "$input" | jq -r '.workspace.current_dir')
 
+# Format a token count: raw number under 1000 (bash integer division would
+# otherwise truncate it to "0K"), one-decimal K above that.
+fmt_tokens() {
+    local n=$1
+    if [ "$n" -lt 1000 ]; then
+        echo "$n"
+    else
+        awk -v n="$n" 'BEGIN { printf "%.1fK", n / 1000 }'
+    fi
+}
+
 if [ "$USAGE" != "null" ]; then
-    # Get individual token counts
+    # input/output here are for the last API turn only, not the session total
     INPUT_TOKENS=$(echo "$USAGE" | jq -r '.input_tokens')
     OUTPUT_TOKENS=$(echo "$USAGE" | jq -r '.output_tokens')
-    CACHE_CREATE=$(echo "$USAGE" | jq -r '.cache_creation_input_tokens')
     CACHE_READ=$(echo "$USAGE" | jq -r '.cache_read_input_tokens')
 
     # Total current context
@@ -22,14 +32,15 @@ if [ "$USAGE" != "null" ]; then
     # Format in K for readability
     CURRENT_K=$((CURRENT_TOKENS / 1000))
     CONTEXT_K=$((CONTEXT_SIZE / 1000))
-    OUTPUT_K=$((OUTPUT_TOKENS / 1000))
     CACHE_READ_K=$((CACHE_READ / 1000))
+    IN_FMT=$(fmt_tokens "$INPUT_TOKENS")
+    OUT_FMT=$(fmt_tokens "$OUTPUT_TOKENS")
 
     # Truncate directory path
     DIR=$(basename "$CURRENT_DIR")
 
     # Build statusline with useful info
-    echo "[$MODEL] ${CURRENT_K}K/${CONTEXT_K}K (${PERCENT_USED}%) | ${CACHE_READ_K}K cached | ${OUTPUT_K}K out | \$${COST}"
+    echo "[$MODEL] ${CURRENT_K}K/${CONTEXT_K}K (${PERCENT_USED}%) | ${CACHE_READ_K}K cached | ${IN_FMT} in | ${OUT_FMT} out | \$${COST}"
 else
     DIR=$(basename "$CURRENT_DIR")
     echo "[$MODEL] Context: 0% | $DIR"
