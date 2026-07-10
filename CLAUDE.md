@@ -22,10 +22,10 @@ cost, broken down**. That drives a clean split:
   - **Tier 2 (offline):** the session analyzers read each transcript's `usage` data and
     report per-session / per-agent / per-model **token + cost** in `--list`, `--digest`,
     and HTML. Cost is a labeled **estimate**; `/cost` and the Usage API are authoritative.
-  - **Tier 3 (historical):** local OTEL Collector → Prometheus → Grafana stack in
-    `.claude/observability/`, driven by `CLAUDE_CODE_ENABLE_TELEMETRY` in `settings.json`.
-    Managed with `claude-telemetry up|down|status`. When the stack is down, OTLP export
-    fails silently with no session impact.
+  - **Tier 3 (historical):** shared local OTEL Collector → Prometheus → Grafana stack in
+    `.claude/observability/`. Claude uses `CLAUDE_CODE_ENABLE_TELEMETRY`; Codex uses native
+    `[otel]` config with raw prompts redacted. Managed with `ai-telemetry up|down|status`
+    (`claude-telemetry` and `codex-telemetry` are compatibility names).
 
 See `docs/OBSERVABILITY.md` for the full rationale and usage guide.
 
@@ -52,7 +52,7 @@ zshrc                    # Loader + Homebrew + completions + starship + zsh plug
   extras.zsh             # PATH exports, NVM, FZF config, Python venv helpers
   git-tools.zsh          # Git/worktree power-user commands (gwt-*, gbr-*, etc.)
   hunt.zsh               # Unified search using fd/rg/fzf
-  observability.zsh      # claude-telemetry (up/down/status) for the Grafana stack
+  observability.zsh      # ai/claude/codex-telemetry helpers for the shared Grafana stack
 .claude/
   CLAUDE.md              # Personal defaults for all projects
   settings.json          # Permissions, telemetry env, env-loader hook, statusline
@@ -61,8 +61,9 @@ zshrc                    # Loader + Homebrew + completions + starship + zsh plug
   tools/session-analyzer/ # Session analysis tool (Tier 2: tokens + cost estimate)
   observability/         # Tier 3: OTEL Collector + Prometheus + Grafana docker stack
 .codex/
-  config.toml            # Codex CLI settings (model, trust levels)
-  tools/session-analyzer/ # Session analysis tool for Codex (tokens + cost estimate)
+  config.toml            # Managed Codex model + native OTEL settings (merged on deploy)
+  tools/merge_config.py  # Preserves app/plugin/MCP state while merging managed keys
+  tools/session-analyzer/ # Root/sub-agent history, trace, token, model, and cost analysis
 docs/
   OBSERVABILITY.md       # Observability vision + two-plane / three-tier guide
 ```
@@ -75,7 +76,7 @@ docs/
 - `claude-session-analyzer --help` - Claude session analysis tool
 - `claude-workflow-analyzer --help` - Describe dynamic workflow runs (wf_*.json)
 - `codex-session-analyzer --help` - Codex session analysis tool
-- `claude-telemetry help` - Grafana/OTEL observability stack control (`cc-obs` alias)
+- `ai-telemetry help` - Shared Grafana/OTEL control (`ai-obs`; provider-specific names work)
 
 Most functions also support `--help` flag:
 - `gwt-ship --help`, `gwt-new --help`, `gwt-go --help`, `gwt-clone-bare --help`
@@ -118,17 +119,22 @@ myproject/
 - `claude-session-analyzer --latest --digest` - Markdown digest for session continuation
 - `claude-session-analyzer <id> --overview` - Session topology: sub-agents, workflows, totals
 - `claude-workflow-analyzer` - List/describe dynamic workflow runs (works outside sessions)
+- `claude-workflow-analyzer <id> --mermaid` - Mermaid flowchart of a run (paste into markdown)
+- `claude-workflow-analyzer <id> --diagram` - Self-contained HTML diagram (phase flow + timeline)
 - `/session-stats` (in-session) - Current session's transcript path + topology overview
 
 **Codex tools:**
 - `codex-session-analyzer --list` - List all sessions
 - `codex-session-analyzer --latest --open` - View latest session trace
 - `codex-session-analyzer --latest --digest` - Markdown digest for session continuation
+- `codex-session-analyzer <id> --overview` - Root/sub-agent topology and token/model totals
+- `codex-session-analyzer <id> --path` - Resolve a transcript path
+- `codex-session-analyzer --project /path --list` - Filter history to an exact project cwd
 
 **Telemetry (Tier 3):**
-- `claude-telemetry up` - Start the OTEL + Prometheus + Grafana stack (Grafana at :3000)
-- `claude-telemetry status` - Show stack health
-- `claude-telemetry down` - Stop the stack
+- `ai-telemetry up` - Start shared OTEL + Prometheus + Grafana (Grafana at :3000)
+- `codex-telemetry status` - Show the same shared stack's health
+- `claude-telemetry down` - Stop the same shared stack
 
 ## Dependencies
 

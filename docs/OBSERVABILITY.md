@@ -50,13 +50,13 @@ durable history. Use the lowest tier that answers your question.
 
 | Tier | What | Setup | Answers | Authoritative? |
 |------|------|-------|---------|----------------|
-| **1 — Live** | `/usage`, `/cost`, `statusline.sh` | none (native) | current session tokens & cost, right now | **Yes** — `/cost` and the Usage API are ground truth |
+| **1 — Live** | native client usage/context UI; Claude `/usage`, `/cost`, statusline | none | current task, right now | Provider-native |
 | **2 — Offline** | `claude-session-analyzer` / `codex-session-analyzer` | none (reads local transcripts) | per-session / per-agent / per-model token + cost for any past session | Estimate |
-| **3 — Historical** | OTEL → Prometheus → Grafana stack | `claude-telemetry up` (Docker) | trends across *all* sessions over time | Estimate (metrics), cost is Claude-reported |
+| **3 — Historical** | shared OTEL → Prometheus → Grafana stack | `ai-telemetry up` (Docker) | token/model/tool/agent trends across *all* tasks | Native exported metrics |
 
 ### Tier 1 — Live (native)
 
-Nothing to install. In any session:
+Nothing to install. Use the client-native context/usage display. In Claude Code:
 
 - **`/usage`** — session tokens + cost + a breakdown of what's driving your limits
   (sub-agents, cache, long-context). This is the "insights" view.
@@ -76,57 +76,70 @@ claude-session-analyzer --list                 # all sessions, with Tokens + Est
 claude-session-analyzer --latest --digest      # markdown digest incl. a Token & Cost section
 claude-session-analyzer --latest --open        # full HTML trace with token/cost stat tiles
 codex-session-analyzer  --latest --digest      # same, for Codex (at parity)
+codex-session-analyzer  --overview             # root + linked sub-agents + model totals
+codex-session-analyzer  --open                 # combined agent-filterable HTML trace
+codex-session-analyzer  --project /path --list # exact cwd history filter
 ```
 
 How the numbers are built:
 
-- Each assistant message carries a `usage` object (`input_tokens`, `output_tokens`,
-  `cache_creation_input_tokens`, `cache_read_input_tokens`) and a `model`. The analyzer sums
-  these across the transcript.
-- Summing per-message `usage` intentionally reflects **billed** input per turn — context is
-  re-sent each turn, and cache-reads are discounted — so the total mirrors real cost, not
-  just the final context size.
-- Cost = `input·rate_in + output·rate_out + cache_write·rate_in·1.25 + cache_read·rate_in·0.10`,
-  from an embedded per-model pricing table.
+- **Claude Code:** each assistant message carries `usage` and `model`; the analyzer sums
+  per-message input/output/cache-write/cache-read buckets.
+- **Codex:** each rollout carries cumulative `token_count` snapshots. The analyzer keeps the
+  final snapshot for that rollout, attributes positive deltas to the active turn model, and
+  follows `parent_thread_id` across separately stored sub-agent rollouts.
+- Codex `cached_input_tokens` is a subset of `input_tokens`, and
+  `reasoning_output_tokens` is a subset of `output_tokens`. The analyzer subtracts cached
+  input before applying the full input rate and bills output once; the previous analyzer
+  incorrectly added both subsets a second time.
+- Both totals intentionally reflect repeated context sent across turns, rather than only the
+  final context-window size.
 
-> **Cost here is an estimate.** The pricing table needs occasional maintenance and the
-> transcript schema is internal/unstable (parsed defensively, fails soft). For anything that
-> must be exact, `/cost` and the Usage API are authoritative. Cross-check a session's
-> analyzer total against `/cost` if precision matters.
+> **Cost here is an estimate.** The pricing table needs maintenance and transcript schemas
+> are internal/unstable (parsed defensively, fails soft). Codex private/internal model slugs
+> without a published API rate display `N/A`; the analyzer never borrows another model's
+> price. Provider billing and subscription usage are authoritative.
+
+The estimate also does not model account-specific discounts or long-context
+multipliers; use it for relative task comparison, not reconciliation.
 
 Reach for Tier 2 when the question is *"what did that task I ran earlier cost, and where did
 the tokens go — which sub-agent, which model?"*
 
 ### Tier 3 — Historical dashboards
 
-A local, self-contained Docker stack captures Claude Code's native OpenTelemetry export and
-graphs it over time. Nothing leaves your machine.
+A local Docker stack captures the native OpenTelemetry exports from Claude Code and Codex
+and graphs them together.
 
 ```
-Claude Code ──OTLP──▶ OpenTelemetry Collector ──scrape──▶ Prometheus ──▶ Grafana
- (:4317/:4318)             (re-exposes :8889)               (:9090)       (:3000)
+Claude Code ─┐
+             ├─ OTLP ─▶ OpenTelemetry Collector ─▶ Prometheus ─▶ Grafana
+Codex ───────┘          (:4317/:4318)             (:9090)       (:3000)
 ```
 
 ```bash
-claude-telemetry up        # start collector + prometheus + grafana (alias: cc-obs)
-claude-telemetry status    # container health
-claude-telemetry logs      # follow the collector (raw exported events)
-claude-telemetry down      # stop & remove
+ai-telemetry up             # start collector + prometheus + grafana (alias: ai-obs)
+codex-telemetry status      # provider-specific compatibility name
+claude-telemetry logs       # follow the same collector
+ai-telemetry down           # stop & remove
 ```
 
-Then open Grafana at **http://localhost:3000** (anonymous admin) → dashboard
-**"Claude Code — Tokens & Cost"**: token usage over time by model, cost over time, tool
-accept/reject rate, active time, session count.
+Grafana at **http://localhost:3000** auto-provisions two dashboards:
 
-Telemetry is turned on by the `env` block in `.claude/settings.json`
-(`CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_*`). **When the stack is down, the OTLP export fails
-silently in the background** — it never blocks, slows, or errors a session. Start the stack
-only when you want to collect; there's no need to keep it running. (Prometheus counters
-re-baseline whenever the collector restarts.)
+- **Claude Code — Tokens & Cost**: token/cost/model trends, active time, and edits.
+- **Codex — Tokens, Agents & Tools**: tokens by type/model, tool outcomes, turn latency,
+  and multi-agent spawns.
 
-Metric names can shift between Claude Code versions, so the bundled dashboard matches series
-by regex (e.g. `claude_code_token_usage.*`) rather than hard-coding suffixes. If a panel is
-empty, open Prometheus `/graph`, type `claude_code` to see the real series names, and adjust.
+Claude telemetry is enabled by `.claude/settings.json`. Codex telemetry is enabled by the
+native `[otel]` block in `.codex/config.toml`; `deploy.sh` merges that block into the live
+config without replacing projects/plugins/MCP settings. Codex raw prompt export stays off.
+When the stack is down, export fails asynchronously without blocking a task. Prometheus
+counters re-baseline when the collector restarts; named Prometheus/Grafana volumes preserve
+stored history and dashboard state across normal container recreation.
+
+Metric names can shift between client/collector versions, so dashboards match series by
+regex (for example `claude_code_token_usage.*` and `codex_turn_token_usage.*_sum`). If a
+panel is empty, open Prometheus `/graph`, search for `claude_code` or `codex_`, and adjust.
 Details: [`.claude/observability/README.md`](../.claude/observability/README.md).
 
 Reach for Tier 3 when the question is *"am I improving — is my cost-per-week going down, and
@@ -134,7 +147,7 @@ what's my model mix and edit-acceptance trend?"*
 
 ## Which tier do I use?
 
-- "What's this session costing **right now**?" → **Tier 1** (`/usage`, `/cost`, statusline)
+- "What's this task doing **right now**?" → **Tier 1** (native usage/context UI)
 - "What did **that task** cost, broken down by agent/model?" → **Tier 2** (analyzer digest)
 - "Am I **improving over time**? Trends across sessions?" → **Tier 3** (Grafana)
 
@@ -142,8 +155,9 @@ what's my model mix and edit-acceptance trend?"*
 
 - **Pricing tables** (Tier 2) live in each analyzer's `parser.py`. When Anthropic/OpenAI
   change rates, update the per-MTok dicts. They're clearly labeled estimates.
-- **Metric names** (Tier 3) — re-verify against the
-  [monitoring-usage docs](https://code.claude.com/docs/en/monitoring-usage) if a panel goes
-  blank after a Claude Code upgrade.
+- **Metric names** (Tier 3) — re-verify against Claude's
+  [monitoring-usage docs](https://code.claude.com/docs/en/monitoring-usage) and Codex's
+  [OTEL catalog](https://learn.chatgpt.com/docs/config-file/config-advanced#observability-and-telemetry)
+  after client upgrades.
 - **The rule** — before adding any new hook, log, or panel, name which of the two questions
   it answers. If it answers neither, don't add it.

@@ -72,7 +72,24 @@ claude-workflow-analyzer                    # List all runs across all projects
 claude-workflow-analyzer wf_9e75b43c-855    # Describe a run by id
 claude-workflow-analyzer --latest --agents  # Newest run, with per-agent table
 claude-workflow-analyzer --latest --samples # One sample agent per phase
+claude-workflow-analyzer wf_9e75b43c --mermaid   # Mermaid flowchart to stdout
+claude-workflow-analyzer wf_9e75b43c --diagram   # Write + open an HTML diagram
 ```
+
+### Diagrams
+
+Two visual renderers turn any run into a picture, both driven by the same
+normalized model — a run has an ordered **phase spine** and **agents fanned out**
+under each phase — so one layout handles 2 agents or 200; large fan-outs collapse
+(`prefix ×N` in Mermaid, `+N more` chips in HTML).
+
+- `--mermaid` — a portable `flowchart TD` printed to stdout, ready to paste into
+  markdown or a PR description. Phases run down the spine; agents branch off,
+  colored by state (done / running / errored).
+- `--html` (or `--diagram` to also open it) — a self-contained, themed HTML page
+  with a **phase-flow strip** (structure at a glance) and a **swimlane Gantt**
+  (agents as time-positioned bars, so fan-out parallelism and the sequential
+  barrier between phases are visible). `--out FILE` picks the path.
 
 ### Digest Output
 

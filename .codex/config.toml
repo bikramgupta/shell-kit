@@ -1,10 +1,13 @@
-model = "gpt-5.2-codex"
-model_reasoning_effort = "high"
+# shell-kit-managed Codex defaults. deploy.sh merges these keys into the user
+# config instead of replacing ~/.codex/config.toml wholesale.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
 
-[notice]
-"hide_gpt-5.1-codex-max_migration_prompt" = true
-
-[notice.model_migrations]
-"gpt-5.1-codex-max" = "gpt-5.2-codex"
-
-[features]
+# Native Codex OpenTelemetry. The exporter batches asynchronously; when the
+# local collector is down, session execution continues normally. User prompt
+# bodies remain redacted while token/tool/model metadata is exported.
+[otel]
+environment = "local"
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "http://localhost:4318/v1/logs", protocol = "binary" } }
+metrics_exporter = { otlp-http = { endpoint = "http://localhost:4318/v1/metrics", protocol = "binary" } }
