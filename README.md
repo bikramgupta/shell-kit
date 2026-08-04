@@ -79,7 +79,7 @@ flowchart TB
 ## Installation
 
 ```bash
-git clone https://github.com/bikramkgupta/shell-kit.git
+git clone https://github.com/bikramgupta/shell-kit.git
 cd shell-kit
 ./deploy.sh
 source ~/.zshrc
