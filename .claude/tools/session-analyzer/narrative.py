@@ -108,6 +108,18 @@ def add_tokens(a, b):
     return a
 
 
+def usage_key(entry):
+    """Identity of the API response an assistant entry belongs to.
+
+    One response is written as SEVERAL JSONL entries — one per content block
+    (thinking, text, tool_use) — and every one of them repeats the same usage
+    object. Summing per entry double- or triple-counts the whole session, so
+    usage must be counted once per message id.
+    """
+    msg = entry.get("message") or {}
+    return msg.get("id") or entry.get("requestId") or entry.get("uuid")
+
+
 # ===========================================================================
 # Transcript loading
 # ===========================================================================
@@ -238,13 +250,24 @@ def r_read(inp, res, err):
         return out
     if isinstance(res, dict):
         f = res.get("file") or {}
+        if res.get("type") == "image" or "base64" in f:
+            # Images are expensive and have no line count — report what costs.
+            b64 = f.get("base64") or ""
+            dims = f.get("dimensions") or {}
+            w, h = dims.get("displayWidth"), dims.get("displayHeight")
+            what = f.get("type") or "image"
+            out.update(bytes=len(b64), lines=0)
+            out["finding"] = (what + (f" {w}x{h}" if w and h else "")
+                              + f", {len(b64):,} base64 chars sent")
+            return out
         content = f.get("content") or ""
         n = f.get("numLines") or content.count("\n")
         off, lim = inp.get("offset"), inp.get("limit")
+        total = f.get("totalLines")
         out.update(lines=n, bytes=len(content))
         out["finding"] = (f"read {n} line(s)"
                           + (f" from line {off}" if off else "")
-                          + (f", limit {lim}" if lim else ""))
+                          + (f" of {total}" if total and n and total > n else ""))
     return out
 
 
@@ -361,22 +384,28 @@ def build(path):
         branch = e.get("gitBranch") or branch
 
     turns = []
+    counted = set()          # message ids whose usage has already been added
     for idx, (pid, es) in enumerate(segment(entries), 1):
         text, kind = user_text(es)
         pending, steps = {}, []
         tokens = zero_tokens()
         turn_model = None
+        requests = 0
 
         for e in es:
             et = e.get("type")
             msg = e.get("message") or {}
             if et == "assistant":
                 turn_model = turn_model or msg.get("model")
-                u = msg.get("usage") or {}
-                tokens["in"] += u.get("input_tokens", 0)
-                tokens["out"] += u.get("output_tokens", 0)
-                tokens["cache_write"] += u.get("cache_creation_input_tokens", 0)
-                tokens["cache_read"] += u.get("cache_read_input_tokens", 0)
+                key = usage_key(e)
+                if key not in counted:
+                    counted.add(key)
+                    requests += 1
+                    u = msg.get("usage") or {}
+                    tokens["in"] += u.get("input_tokens", 0)
+                    tokens["out"] += u.get("output_tokens", 0)
+                    tokens["cache_write"] += u.get("cache_creation_input_tokens", 0)
+                    tokens["cache_read"] += u.get("cache_read_input_tokens", 0)
 
             c = msg.get("content")
             if not isinstance(c, list):
@@ -434,7 +463,7 @@ def build(path):
             "n": idx, "prompt_id": pid, "prompt": text, "prompt_kind": kind,
             "model": turn_model, "start": t_start, "end": t_end,
             "duration": secs(t_start, t_end), "steps": steps, "tokens": tokens,
-            "n_tools": len(tools),
+            "api_requests": requests, "n_tools": len(tools),
             "n_failed": sum(1 for s in tools if s.get("ok") is False),
             "n_retries": sum(1 for s in tools if "retry_of" in s),
         })
@@ -543,9 +572,16 @@ def wrap(text, width, indent):
 
 
 def token_line(t):
-    """The three token classes, with the cache split available on demand."""
-    cached = t["cache_write"] + t["cache_read"]
-    return f"{tok(t['in'])} in · {tok(cached)} cached · {tok(t['out'])} out"
+    """What the API actually had to process this turn.
+
+    `input_tokens` alone is misleading: under prompt caching it is only the
+    residual after the last cache breakpoint (often single digits). A new
+    prompt and any freshly added context are billed as cache WRITES, so
+    "new" = input + cache_write is the number that answers "how much did
+    this turn add", and cache_read is the conversation being re-sent cheaply.
+    """
+    return (f"{tok(t['in'] + t['cache_write'])} new · "
+            f"{tok(t['cache_read'])} from cache · {tok(t['out'])} out")
 
 
 def render_text(d, heavy):
@@ -561,8 +597,9 @@ def render_text(d, heavy):
              f"{Path(d['project']).name} · {d['branch']}")
     L.append(f"  {len(d['turns'])} turns · {len(tl_all)} tool calls · "
              f"{nf} failed · {nr} retried")
-    L.append(f"  {tok(tk['in'])} in · {tok(tk['cache_write'])} cache-write · "
-             f"{tok(tk['cache_read'])} cache-read · {tok(tk['out'])} out "
+    L.append(f"  {tok(tk['in'] + tk['cache_write'])} new in "
+             f"({tok(tk['in'])} uncached + {tok(tk['cache_write'])} cache-write) · "
+             f"{tok(tk['cache_read'])} from cache · {tok(tk['out'])} out "
              f"· ~${d['cost']:.2f}")
     L.append("━" * W)
     L.append("")
@@ -621,9 +658,12 @@ def render_text(d, heavy):
         L.append("─" * W)
         L.append("")
 
-    L.append("Result sizes are estimated from returned bytes. Token counts come "
-             "from the transcript's")
-    L.append("usage records; cost is an estimate — /cost is authoritative.")
+    L.append("Tokens are counted once per API response (one response spans "
+             "several transcript entries).")
+    L.append("Under prompt caching a new prompt is billed as a cache WRITE, so "
+             "'uncached' stays tiny.")
+    L.append("Result sizes are estimated from returned bytes; cost is an "
+             "estimate — /cost is authoritative.")
     return "\n".join(L)
 
 
@@ -729,11 +769,14 @@ def turn_html(t, heavy):
         flags.append(f'<span class="flag heavy">{hv} heavy</span>')
 
     tk = t["tokens"]
-    cached = tk["cache_write"] + tk["cache_read"]
-    toks = (f'<span class="tk"><b>{tok(tk["in"])}</b> in</span>'
-            f'<span class="tk" title="{tok(tk["cache_write"])} written, '
-            f'{tok(tk["cache_read"])} read"><b>{tok(cached)}</b> cached</span>'
-            f'<span class="tk"><b>{tok(tk["out"])}</b> out</span>')
+    new_in = tk["in"] + tk["cache_write"]
+    toks = (f'<span class="tk" title="{tok(tk["cache_write"])} billed as cache '
+            f'writes + {tok(tk["in"])} uncached — your prompt and any newly '
+            f'added context land here"><b>{tok(new_in)}</b> new in</span>'
+            f'<span class="tk" title="conversation re-sent from cache at 0.1x '
+            f'rate"><b>{tok(tk["cache_read"])}</b> from cache</span>'
+            f'<span class="tk"><b>{tok(tk["out"])}</b> out</span>'
+            f'<span class="tk"><b>{t["api_requests"]}</b> requests</span>')
 
     steps = "".join(step_html(s, heavy) for s in t["steps"])
     prompt = (f'<div class="prompt"><span class="kind">You</span>'
@@ -961,9 +1004,10 @@ h1{{font:600 clamp(24px,3.4vw,40px)/1.15 var(--mono);letter-spacing:-.02em;margi
 
   <div class="tiles money">
     <div class="tile"><div class="k">Input</div><div class="v">{tok(tk["in"])}</div>
-      <div class="sub">fresh prompt tokens</div></div>
+      <div class="sub">uncached residual only</div></div>
     <div class="tile"><div class="k">Cache write</div>
-      <div class="v">{tok(tk["cache_write"])}</div><div class="sub">1.25&times; input rate</div></div>
+      <div class="v">{tok(tk["cache_write"])}</div>
+      <div class="sub">your prompts land here &middot; 1.25&times;</div></div>
     <div class="tile"><div class="k">Cache read</div>
       <div class="v">{tok(tk["cache_read"])}</div><div class="sub">0.1&times; input rate</div></div>
     <div class="tile"><div class="k">Output</div><div class="v">{tok(tk["out"])}</div>
@@ -985,9 +1029,14 @@ h1{{font:600 clamp(24px,3.4vw,40px)/1.15 var(--mono);letter-spacing:-.02em;margi
 <main>{turns}</main>
 
 <div class="foot">
-  Token counts are the transcript's own usage records. Result sizes are estimated
-  from returned bytes at ~4 chars/token. Cost is an estimate; <code>/cost</code>
-  and the Usage &amp; Cost API are authoritative.<br>
+  Token counts are the transcript's own usage records, counted once per API
+  response — one response is written as several entries (thinking, text,
+  tool_use) that each repeat the same usage block.
+  Under prompt caching, <code>input_tokens</code> is only the residual after the
+  last cache breakpoint, so it reads as single digits; a new prompt is billed as
+  a cache <em>write</em>. Result sizes are estimated from returned bytes at ~4
+  chars/token. Cost is an estimate; <code>/cost</code> and the Usage &amp; Cost
+  API are authoritative.<br>
   Retries are inferred, not recorded: a failed call followed by the same tool on
   the same target within the same turn.
 </div>

@@ -298,6 +298,7 @@ def extract_session_summary(filepath: Path) -> dict:
     # transcripts are separate files; the digest/HTML show the full breakdown).
     tok_totals = {k: 0 for k in _TOKEN_FIELDS}
     tok_cost = 0.0
+    tok_counted = set()
 
     try:
         with open(filepath) as f:
@@ -326,7 +327,8 @@ def extract_session_summary(filepath: Path) -> dict:
 
                     # Accumulate token usage / cost
                     u = extract_usage(entry)
-                    if u:
+                    if u and usage_key(entry) not in tok_counted:
+                        tok_counted.add(usage_key(entry))
                         for k in _TOKEN_FIELDS:
                             tok_totals[k] += u[k]
                         tok_cost += estimate_cost(
@@ -483,15 +485,32 @@ _TOKEN_FIELDS = ("input_tokens", "output_tokens",
                  "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
+def usage_key(entry: dict) -> str:
+    """Identity of the API response an assistant entry belongs to.
+
+    A single API response is written to the transcript as SEVERAL entries —
+    one per content block (thinking, text, tool_use) — and each one repeats
+    the *same* usage object. Counting per entry inflates every total (roughly
+    2x in practice), so usage must be counted once per message id.
+    """
+    message = entry.get("message") or {}
+    return message.get("id") or entry.get("requestId") or entry.get("uuid") or ""
+
+
 def aggregate_tokens(entries: list[dict]) -> dict:
     """Sum token usage across transcript entries → totals, per-model, cost estimate."""
     totals = {k: 0 for k in _TOKEN_FIELDS}
     per_model = {}
     cost = 0.0
+    counted = set()
     for entry in entries:
         u = extract_usage(entry)
         if not u:
             continue
+        key = usage_key(entry)
+        if key in counted:      # same API response, another content block
+            continue
+        counted.add(key)
         for k in _TOKEN_FIELDS:
             totals[k] += u[k]
         pm = per_model.setdefault(u["model"], {**{k: 0 for k in _TOKEN_FIELDS}, "cost": 0.0})
@@ -718,6 +737,7 @@ def extract_cloud_metadata(entries: list[dict]) -> dict:
     }
 
     seen_files = set()  # Track unique files
+    counted_usage = set()  # message ids whose usage has been counted
 
     for entry in entries:
         message = entry.get("message", {})
@@ -736,7 +756,8 @@ def extract_cloud_metadata(entries: list[dict]) -> dict:
 
             # Usage stats
             usage = message.get("usage", {})
-            if usage:
+            if usage and usage_key(entry) not in counted_usage:
+                counted_usage.add(usage_key(entry))
                 cloud_stats["total_input_tokens"] += usage.get("input_tokens", 0)
                 cloud_stats["total_output_tokens"] += usage.get("output_tokens", 0)
                 cloud_stats["total_cache_creation_tokens"] += usage.get("cache_creation_input_tokens", 0)
