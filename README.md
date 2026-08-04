@@ -6,15 +6,15 @@ Modular zsh configuration + AI coding assistant settings for macOS.
 
 - **Zsh configuration** - Git worktree commands, Docker aliases, unified search with `hunt`
 - **Claude Code settings** - Permissions, telemetry, per-project env loading, statusline
-- **Observability** - Token/cost accounting in the session analyzers + an optional local
-  Grafana stack for cross-session trends
-- **Codex settings** - Config and session analyzer (token + cost, at parity with Claude)
+- **Observability** - Claude Code + Codex token/agent analysis and an optional shared
+  OpenTelemetry + Grafana stack for cross-session trends
+- **Codex settings** - Safely merged config, native OTEL export, and a current session analyzer
 
 ## Architecture
 
 Two flows come together here: a **deploy flow** that assembles your `~/.zshrc` and Claude/Codex
-config from version-controlled modules, and a **telemetry flow** where every Claude Code
-session streams tokens/cost into a local Prometheus + Grafana stack running in Docker Compose.
+config from version-controlled modules, and a **telemetry flow** where Claude Code and Codex
+stream native OTLP data into one local Prometheus + Grafana stack.
 
 ```mermaid
 flowchart TB
@@ -25,7 +25,7 @@ flowchart TB
         CX[".codex/<br/>config.toml · tools/"]
     end
 
-    D{{"./deploy.sh<br/>diff · backup · copy"}}
+    D{{"./deploy.sh<br/>diff · backup · copy/merge"}}
     Z --> D
     M --> D
     CC --> D
@@ -45,8 +45,10 @@ flowchart TB
 
     CLAUDE(["Claude Code session"])
     HC -.->|"CLAUDE_CODE_ENABLE_TELEMETRY=1"| CLAUDE
+    CODEX(["Codex session"])
+    HX -.->|"[otel] · prompts redacted"| CODEX
 
-    subgraph obs["Docker Compose — claude-obs (Tier 3, opt-in)"]
+    subgraph obs["Docker Compose — shared OTEL stack (Tier 3, opt-in)"]
         COL["OTEL Collector<br/>:4317 / :4318"]
         PROM["Prometheus<br/>:9090"]
         GRAF["Grafana<br/>:3000"]
@@ -54,16 +56,19 @@ flowchart TB
     end
 
     CLAUDE -->|"OTLP metrics + logs"| COL
+    CODEX -->|"OTLP metrics + logs"| COL
 ```
 
 - **Deploy flow (top):** `./deploy.sh` diffs, backs up, then copies the repo's `zshrc`, `.zsh/`
-  modules, and `.claude/` + `.codex/` config into your home directory. Your `~/.zshrc` sources
+  modules, and `.claude/` files into your home directory. It merges shell-kit's model/OTEL
+  keys into `~/.codex/config.toml`, preserving app-managed projects, plugins, MCP servers,
+  notifications, and permissions. Your `~/.zshrc` sources
   every `.zsh/*.zsh` module plus your private `~/.zshrc.local` (personal aliases/exports that
   `deploy.sh` never overwrites).
-- **Telemetry flow (bottom):** with telemetry enabled in `~/.claude/settings.json`, each Claude
-  Code session exports OTLP to the local **Docker Compose** stack — **OTEL Collector →
-  Prometheus → Grafana** — brought up on demand with `claude-telemetry up`. When the stack is
-  down (or Docker isn't installed) the export silently no-ops with zero session impact.
+- **Telemetry flow (bottom):** Claude Code uses the env block in `~/.claude/settings.json`;
+  Codex uses the native `[otel]` block in `~/.codex/config.toml` with raw prompts disabled.
+  Both export to **OTEL Collector → Prometheus → Grafana**, started with `ai-telemetry up`
+  (`claude-telemetry` and `codex-telemetry` are compatible names).
 
 ## Requirements
 
@@ -74,7 +79,7 @@ flowchart TB
 ## Installation
 
 ```bash
-git clone https://github.com/bikramkgupta/shell-kit.git
+git clone https://github.com/bikramgupta/shell-kit.git
 cd shell-kit
 ./deploy.sh
 source ~/.zshrc
@@ -88,7 +93,7 @@ dkhelp                         # Docker commands
 hunt -h                        # Search commands
 claude-session-analyzer --help # Claude session viewer (tokens + cost estimate)
 codex-session-analyzer --help  # Codex session viewer (tokens + cost estimate)
-claude-telemetry help          # Local OTEL + Grafana stack control
+ai-telemetry help              # Shared Claude Code + Codex OTEL/Grafana stack
 ```
 
 ## Observability
@@ -98,12 +103,13 @@ or session cost, broken down?* Three tiers, escalating from zero-setup to durabl
 
 | Tier | Tool | Answers |
 |------|------|---------|
-| 1 — live | `/usage`, `/cost`, `statusline.sh` | current session tokens & cost, at a glance |
-| 2 — offline | `claude-session-analyzer --latest --digest` | per-session / per-agent / per-model token + cost |
-| 3 — historical | `claude-telemetry up` → Grafana at `localhost:3000` | cost/token trends across many sessions |
+| 1 — live | native client usage/context UI | current task at a glance |
+| 2 — offline | `claude-session-analyzer` / `codex-session-analyzer` | per-task / per-agent / per-model tokens and estimated cost |
+| 3 — historical | `ai-telemetry up` → Grafana at `localhost:3000` | token/model/tool/agent trends across tasks |
 
-Cost figures from the analyzers are **estimates** from an embedded pricing table; `/cost` and
-the Usage API are authoritative. Full rationale and usage: [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
+Cost figures are **API-rate estimates** for publicly priced model IDs. Private Codex model
+slugs show `N/A` instead of borrowing a guessed price. Provider billing and subscription
+usage are authoritative. Full rationale: [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
 
 ## License
 

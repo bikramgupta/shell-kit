@@ -1,16 +1,17 @@
-# Claude Code local observability stack
+# Shared Claude Code + Codex local observability stack
 # OpenTelemetry Collector -> Prometheus -> Grafana
 #
-# Start with:  claude-telemetry up   (see .zsh/observability.zsh)
+# Start with:  ai-telemetry up   (claude-telemetry/codex-telemetry also work)
 # Or directly: docker compose -f docker-compose.yml up -d
 #
 # Compose project name (containers/network prefixed with this).
+# Keep the legacy project/container names so upgrades retain existing Grafana data.
 name: claude-obs
 
 services:
   # ---------------------------------------------------------------------------
   # OpenTelemetry Collector (contrib build - has the prometheus exporter).
-  # Receives OTLP from Claude Code, re-exposes metrics for Prometheus to scrape.
+  # Receives OTLP from Claude Code and Codex, re-exposes metrics for Prometheus.
   # ---------------------------------------------------------------------------
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -35,6 +36,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     ports:
       - "9090:9090"   # http://localhost:9090
     networks:
@@ -69,4 +71,5 @@ networks:
     driver: bridge
 
 volumes:
+  prometheus-data:
   grafana-data:

@@ -1,7 +1,7 @@
-# OpenTelemetry Collector config for the Claude Code telemetry stack.
+# OpenTelemetry Collector config for the shared Claude Code + Codex stack.
 # Minimal, valid for otel/opentelemetry-collector-contrib.
 #
-# Claude Code exports OTLP (metrics + logs). We re-expose metrics on :8889 for
+# Both clients export OTLP (metrics + logs). We re-expose metrics on :8889 for
 # Prometheus to scrape, and dump logs to stdout (view with `claude-telemetry logs`).
 
 receivers:

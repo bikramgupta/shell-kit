@@ -1,4 +1,4 @@
-# Prometheus config for the Claude Code telemetry stack.
+# Prometheus config for the shared Claude Code + Codex telemetry stack.
 # Scrapes the OpenTelemetry Collector's prometheus exporter.
 
 global:

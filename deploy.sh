@@ -48,11 +48,14 @@ check_remote_additions() {
   # Check ~/.zshrc for unique content
   if [[ -f "$HOME_ZSHRC" ]]; then
     # Extract non-comment, non-empty lines and compare
-    local remote_lines=$(grep -v '^[[:space:]]*#' "$HOME_ZSHRC" 2>/dev/null | grep -v '^[[:space:]]*$' | sort -u)
-    local local_lines=$(grep -v '^[[:space:]]*#' "$LOCAL_ZSHRC" 2>/dev/null | grep -v '^[[:space:]]*$' | sort -u)
+    local remote_lines
+    remote_lines=$(grep -v '^[[:space:]]*#' "$HOME_ZSHRC" 2>/dev/null | grep -v '^[[:space:]]*$' | sort -u)
+    local local_lines
+    local_lines=$(grep -v '^[[:space:]]*#' "$LOCAL_ZSHRC" 2>/dev/null | grep -v '^[[:space:]]*$' | sort -u)
 
     # Find lines in remote not in local
-    local unique_remote=$(comm -23 <(echo "$remote_lines") <(echo "$local_lines") 2>/dev/null || true)
+    local unique_remote
+    unique_remote=$(comm -23 <(echo "$remote_lines") <(echo "$local_lines") 2>/dev/null || true)
 
     if [[ -n "$unique_remote" ]]; then
       echo -e "${RED}WARNING: ~/.zshrc has content not in local:${NC}"
@@ -69,7 +72,8 @@ check_remote_additions() {
   if [[ -d "$HOME_ZSH_DIR" ]]; then
     for remote_file in "$HOME_ZSH_DIR"/*.zsh; do
       [[ -f "$remote_file" ]] || continue
-      local filename=$(basename "$remote_file")
+      local filename
+      filename=$(basename "$remote_file")
       local local_file="$LOCAL_ZSH_DIR/$filename"
 
       if [[ ! -f "$local_file" ]]; then
@@ -108,7 +112,8 @@ show_diffs() {
   # Check .zsh directory files
   for local_file in "$LOCAL_ZSH_DIR"/*.zsh; do
     [[ -f "$local_file" ]] || continue
-    local filename=$(basename "$local_file")
+    local filename
+    filename=$(basename "$local_file")
     local remote_file="$HOME_ZSH_DIR/$filename"
 
     if [[ -f "$remote_file" ]]; then
@@ -166,7 +171,8 @@ deploy_files() {
   # Copy all .zsh files
   for local_file in "$LOCAL_ZSH_DIR"/*.zsh; do
     [[ -f "$local_file" ]] || continue
-    local filename=$(basename "$local_file")
+    local filename
+    filename=$(basename "$local_file")
     cp "$local_file" "$HOME_ZSH_DIR/$filename"
     echo -e "  ${GREEN}Deployed:${NC} ~/.zsh/$filename"
   done
@@ -289,11 +295,11 @@ deploy_claude_settings() {
     if ! command -v docker >/dev/null 2>&1; then
       echo -e "  ${YELLOW}WARNING:${NC} Docker not found — Tier 3 telemetry dashboards are bypassed."
       echo -e "           Claude Code's OTLP export fails silently (no session impact)."
-      echo -e "           Install Docker, then run 'claude-telemetry up' to enable Grafana."
+      echo -e "           Install Docker, then run 'ai-telemetry up' to enable Grafana."
     elif ! docker info >/dev/null 2>&1; then
-      echo -e "  ${YELLOW}Telemetry:${NC} Docker installed but not running — start Docker, then 'claude-telemetry up'."
+      echo -e "  ${YELLOW}Telemetry:${NC} Docker installed but not running — start Docker, then 'ai-telemetry up'."
     else
-      echo -e "  ${GREEN}Telemetry:${NC} Docker detected — run 'claude-telemetry up' for Grafana dashboards."
+      echo -e "  ${GREEN}Telemetry:${NC} Docker detected — run 'ai-telemetry up' for Grafana dashboards."
     fi
   fi
 
@@ -321,6 +327,7 @@ deploy_claude_settings() {
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/analyze.sh" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/workflow.py" 2>/dev/null || true
+    chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/narrative.py" 2>/dev/null || true
     echo -e "  ${GREEN}Deployed:${NC} ~/.claude/tools/"
   fi
 
@@ -335,6 +342,11 @@ deploy_claude_settings() {
   if [[ -f "$wf_analyzer" ]]; then
     ln -sf "$wf_analyzer" "$HOME/.local/bin/claude-workflow-analyzer"
     echo -e "  ${GREEN}Symlinked:${NC} claude-workflow-analyzer -> ~/.local/bin/"
+  fi
+  local narrative="$HOME_CLAUDE_DIR/tools/session-analyzer/narrative.py"
+  if [[ -f "$narrative" ]]; then
+    ln -sf "$narrative" "$HOME/.local/bin/claude-session-narrative"
+    echo -e "  ${GREEN}Symlinked:${NC} claude-session-narrative -> ~/.local/bin/"
   fi
 
   echo ""
@@ -368,10 +380,13 @@ deploy_codex_settings() {
 
   mkdir -p "$HOME_CODEX_DIR/tools"
 
-  # Config file
+  # Merge shell-kit-managed model + OTEL settings into the live config. Codex
+  # Desktop and plugins also maintain this file (projects, MCP servers, plugin
+  # state, notification helpers), so replacing it wholesale destroys live state.
   if [[ -f "$LOCAL_CODEX_DIR/config.toml" ]]; then
-    cp "$LOCAL_CODEX_DIR/config.toml" "$HOME_CODEX_DIR/"
-    echo -e "  ${GREEN}Deployed:${NC} ~/.codex/config.toml"
+    python3 "$LOCAL_CODEX_DIR/tools/merge_config.py" \
+      "$LOCAL_CODEX_DIR/config.toml" "$HOME_CODEX_DIR/config.toml"
+    echo -e "  ${GREEN}Merged:${NC} ~/.codex/config.toml (model + OTEL; preserved app/plugin state)"
   fi
 
   # Tools (recursive copy)
@@ -379,6 +394,7 @@ deploy_codex_settings() {
     cp -r "$LOCAL_CODEX_DIR/tools/"* "$HOME_CODEX_DIR/tools/" 2>/dev/null || true
     chmod +x "$HOME_CODEX_DIR/tools/session-analyzer/analyze.sh" 2>/dev/null || true
     chmod +x "$HOME_CODEX_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
+    chmod +x "$HOME_CODEX_DIR/tools/merge_config.py" 2>/dev/null || true
     echo -e "  ${GREEN}Deployed:${NC} ~/.codex/tools/"
   fi
 
@@ -471,5 +487,6 @@ echo "  dkhelp                   - Docker commands"
 echo "  hunt -h                  - Search commands"
 echo "  claude-session-analyzer  - Analyze Claude sessions (tokens + cost)"
 echo "  claude-workflow-analyzer - Describe dynamic workflow runs (wf_*.json)"
+echo "  claude-session-narrative - Read a session turn by turn (prompt -> tools -> reply)"
 echo "  codex-session-analyzer   - Analyze Codex sessions (tokens + cost)"
-echo "  claude-telemetry help    - Local OTEL + Grafana stack (cc-obs)"
+echo "  ai-telemetry help        - Shared Claude + Codex OTEL/Grafana stack (ai-obs)"

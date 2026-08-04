@@ -1,0 +1,121 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Codex native OpenTelemetry metrics. Regex selectors tolerate Prometheus suffix translation; verify live names in Prometheus after Codex/collector upgrades.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Exported Tokens",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "refId": "A", "expr": "sum({__name__=~\"codex_turn_token_usage.*_sum\", token_type=\"total\"})", "instant": true, "legendFormat": "tokens" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Turns",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "refId": "A", "expr": "sum({__name__=~\"codex_turn_e2e_duration_ms.*_count\"})", "instant": true, "legendFormat": "turns" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Tool Calls",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "refId": "A", "expr": "sum({__name__=~\"codex_tool_call(_total)?\"})", "instant": true, "legendFormat": "tools" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Sub-agents Spawned",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "refId": "A", "expr": "sum({__name__=~\"codex_multi_agent_spawn(_total)?\"})", "instant": true, "legendFormat": "agents" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Token Usage by Type",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 16, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "stacking": { "group": "A", "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "expr": "sum by (token_type) (increase({__name__=~\"codex_turn_token_usage.*_sum\"}[$__rate_interval]))", "legendFormat": "{{token_type}}" }]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Token Usage by Model",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "stacking": { "group": "A", "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "expr": "sum by (model) (increase({__name__=~\"codex_turn_token_usage.*_sum\", token_type=\"total\"}[$__rate_interval]))", "legendFormat": "{{model}}" }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Tool Calls by Tool and Outcome",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 35, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "stacking": { "group": "A", "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "refId": "A", "expr": "sum by (tool, success) (increase({__name__=~\"codex_tool_call(_total)?\"}[$__rate_interval]))", "legendFormat": "{{tool}} · {{success}}" }]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Turn Duration (p95)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "stacking": { "group": "A", "mode": "none" } } }, "overrides": [] },
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate({__name__=~\"codex_turn_e2e_duration_ms.*_bucket\"}[$__rate_interval])))", "legendFormat": "p95" }]
+    },
+    {
+      "id": 9,
+      "type": "text",
+      "title": "About Codex telemetry",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 20 },
+      "options": { "mode": "markdown", "content": "Codex exports native OTEL metrics with `log_user_prompt = false`. The dashboard uses regex metric selectors because the collector translates dots and appends units/counter/histogram suffixes. If a panel is empty, search for `codex_` at Prometheus and adjust the expression. For exact per-session/main/sub-agent inspection, run `codex-session-analyzer --overview` or `--open`. Cost stays offline because private Codex model slugs do not always have a public API rate." }
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["codex", "opentelemetry", "tokens", "agents"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Codex — Tokens, Agents & Tools",
+  "uid": "codex-telemetry",
+  "version": 1,
+  "weekStart": ""
+}
