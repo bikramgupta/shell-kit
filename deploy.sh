@@ -327,6 +327,7 @@ deploy_claude_settings() {
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/analyze.sh" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/workflow.py" 2>/dev/null || true
+    chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/narrative.py" 2>/dev/null || true
     echo -e "  ${GREEN}Deployed:${NC} ~/.claude/tools/"
   fi
 
@@ -341,6 +342,11 @@ deploy_claude_settings() {
   if [[ -f "$wf_analyzer" ]]; then
     ln -sf "$wf_analyzer" "$HOME/.local/bin/claude-workflow-analyzer"
     echo -e "  ${GREEN}Symlinked:${NC} claude-workflow-analyzer -> ~/.local/bin/"
+  fi
+  local narrative="$HOME_CLAUDE_DIR/tools/session-analyzer/narrative.py"
+  if [[ -f "$narrative" ]]; then
+    ln -sf "$narrative" "$HOME/.local/bin/claude-session-narrative"
+    echo -e "  ${GREEN}Symlinked:${NC} claude-session-narrative -> ~/.local/bin/"
   fi
 
   echo ""
@@ -481,5 +487,6 @@ echo "  dkhelp                   - Docker commands"
 echo "  hunt -h                  - Search commands"
 echo "  claude-session-analyzer  - Analyze Claude sessions (tokens + cost)"
 echo "  claude-workflow-analyzer - Describe dynamic workflow runs (wf_*.json)"
+echo "  claude-session-narrative - Read a session turn by turn (prompt -> tools -> reply)"
 echo "  codex-session-analyzer   - Analyze Codex sessions (tokens + cost)"
 echo "  ai-telemetry help        - Shared Claude + Codex OTEL/Grafana stack (ai-obs)"

@@ -59,6 +59,7 @@ zshrc                    # Loader + Homebrew + completions + starship + zsh plug
   statusline.sh          # Custom status bar script (Tier 1 live cost/context bar)
   commands/              # Custom command definitions (e.g., squash-commits)
   tools/session-analyzer/ # Session analysis tool (Tier 2: tokens + cost estimate)
+                          #   narrative.py = turn-by-turn replay of a session
   observability/         # Tier 3: OTEL Collector + Prometheus + Grafana docker stack
 .codex/
   config.toml            # Managed Codex model + native OTEL settings (merged on deploy)
@@ -121,6 +122,9 @@ myproject/
 - `claude-workflow-analyzer` - List/describe dynamic workflow runs (works outside sessions)
 - `claude-workflow-analyzer <id> --mermaid` - Mermaid flowchart of a run (paste into markdown)
 - `claude-workflow-analyzer <id> --diagram` - Self-contained HTML diagram (phase flow + timeline)
+- `claude-session-narrative <id>` - Read a session as a story: prompt → tool calls → what
+  each returned → reply. Flags failures, inferred retries, and oversized tool results.
+  Opens a self-contained HTML page (no server); `--text` renders it in the terminal.
 - `/session-stats` (in-session) - Current session's transcript path + topology overview
 
 **Codex tools:**
