@@ -26,23 +26,31 @@ DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 DEFAULT_SESSIONS_DIR = DEFAULT_CODEX_HOME / "sessions"
 DEFAULT_ARCHIVED_DIR = DEFAULT_CODEX_HOME / "archived_sessions"
 
-# Public API list prices in USD per 1M tokens. These are estimates for API-style
-# billing, not authoritative ChatGPT/Codex subscription charges. Deliberately do
-# not guess a price for private/internal model slugs (for example gpt-5.6-sol or
-# codex-auto-review); those render as N/A until a public rate exists.
-PRICING_USD_PER_MTOK = {
-    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
-    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
-    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
-    "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
-    "gpt-5.2-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
-    "gpt-5.2": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
-    "gpt-5.1-codex": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "gpt-5.1": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "gpt-5-codex": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "codex-mini-latest": {"input": 1.50, "cached_input": 0.375, "output": 6.00},
-}
+
+# Prices are data, not code: they live in models.json and are merged from the
+# shipped defaults, ~/.config/ai-tools/pricing.json, $AI_MODEL_PRICING, and
+# --pricing-file. A model with no entry is reported N/A and named, never
+# silently priced at some neighbouring model's rate.
+def _import_pricing():
+    here = Path(__file__).resolve().parent
+    for candidate in (here, here.parents[2] / "shared" / "pricing"):
+        if (candidate / "pricing.py").exists():
+            sys.path.insert(0, str(candidate))
+            break
+    import pricing as _pricing
+
+    return _pricing
+
+
+pricing_mod = _import_pricing()
+_PRICING = None
+
+
+def get_pricing(path=None):
+    global _PRICING
+    if _PRICING is None:
+        _PRICING = pricing_mod.load(path)
+    return _PRICING
 
 USAGE_FIELDS = (
     "input_tokens",
@@ -160,38 +168,35 @@ def usage_has_tokens(usage):
     return any((usage or {}).get(field, 0) for field in USAGE_FIELDS)
 
 
-def public_model_key(model):
-    model = (model or "").lower()
-    if model in PRICING_USD_PER_MTOK:
-        return model
-    # Public date snapshots keep the base model prefix. Match longest first so
-    # gpt-5.4-mini-* does not accidentally match gpt-5.4.
-    for key in sorted(PRICING_USD_PER_MTOK, key=len, reverse=True):
-        if model.startswith(key + "-") and re.search(r"-20\d{2}-\d{2}-\d{2}$", model):
-            return key
-    return None
+def to_buckets(usage):
+    """Codex token fields -> the shared pricing buckets.
+
+    Codex reports subsets, not addends: cached input is already inside
+    input_tokens, and reasoning output is already inside output_tokens. So the
+    billable split is (input - cached) at full rate and cached at the cache-read
+    rate; reasoning is never added again. Codex has no cache-write line item.
+    """
+    usage = normalize_usage(usage)
+    cached = min(usage["cached_input_tokens"], usage["input_tokens"])
+    return {
+        "input": max(usage["input_tokens"] - cached, 0),
+        "cache_read": cached,
+        "cache_write": 0,
+        "output": usage["output_tokens"],
+    }
 
 
 def estimate_cost(model, usage):
-    """Estimate cost without double-counting cached or reasoning subsets."""
+    """Estimated USD, or None when this model has no configured price."""
     usage = normalize_usage(usage)
     if not usage_has_tokens(usage):
         return None
-    key = public_model_key(model)
-    if not key:
-        return None
-    rates = PRICING_USD_PER_MTOK[key]
-    cached = min(usage["cached_input_tokens"], usage["input_tokens"])
-    uncached = max(usage["input_tokens"] - cached, 0)
-    # output_tokens already includes reasoning_output_tokens.
-    return (
-        uncached * rates["input"]
-        + cached * rates["cached_input"]
-        + usage["output_tokens"] * rates["output"]
-    ) / 1_000_000.0
+    return get_pricing().cost(model, to_buckets(usage))
 
 
 def estimate_model_usage(model_usage):
+    """(total, unpriced models). Total is None if anything went unpriced, so a
+    partial sum is never mistaken for the whole bill."""
     total = 0.0
     unknown = []
     for model, usage in (model_usage or {}).items():
@@ -278,7 +283,100 @@ def maybe_parse_json(value):
     return value
 
 
+# ---------------------------------------------------------------------------
+# Decoding Codex's `exec` tool
+#
+# Codex's dominant tool is `exec`, and its `input` is not JSON -- it is a
+# JavaScript program that calls back into the harness:
+#
+#   const r = await tools.shell_command({command:"rg -n foo", "workdir":"/x"});
+#   text(r);
+#
+# Note the mixed quoting: `command` is a bare key, `"workdir"` is quoted. That
+# is why json.loads fails on it, and why anything that regex-scrapes the raw
+# string ends up quoting JSON shrapnel instead of the command. We parse the
+# call sites properly: find each tools.NAME(...) invocation, take its balanced
+# argument text (skipping over string literals so a brace inside a shell
+# command cannot end the scan early), then read the key/value pairs.
+# ---------------------------------------------------------------------------
+JS_CALL_RE = re.compile(r"tools\.([A-Za-z_]\w*)\s*\(")
+JS_PAIR_RE = re.compile(
+    r"""["']?(\w+)["']?\s*:\s*"""
+    r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|-?\d+(?:\.\d+)?|true|false|null)""",
+    re.S,
+)
+
+
+def _js_literal(token):
+    if not token:
+        return ""
+    if token[0] in "\"'":
+        body = token[1:-1]
+        for src, dst in (
+            ("\\n", "\n"), ("\\t", "\t"), ("\\r", "\r"),
+            ('\\"', '"'), ("\\'", "'"), ("\\\\", "\\"),
+        ):
+            body = body.replace(src, dst)
+        return body
+    return token
+
+
+def _balanced(text, start):
+    """Text inside the parens opening at `start`, string-literal aware."""
+    depth, i, quote = 0, start, None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i]
+        i += 1
+    return text[start + 1:]
+
+
+def decode_exec_script(text):
+    """Every tools.* call in an exec script, as [{tool, args{}}]."""
+    if not isinstance(text, str) or "tools." not in text:
+        return []
+    calls = []
+    for match in JS_CALL_RE.finditer(text):
+        inner = _balanced(text, match.end() - 1)
+        args = {key: _js_literal(val) for key, val in JS_PAIR_RE.findall(inner)}
+        calls.append({"tool": match.group(1), "args": args})
+    return calls
+
+
+def exec_commands(text):
+    """Just the shell commands an exec script runs, in order."""
+    out = []
+    for call in decode_exec_script(text):
+        cmd = call["args"].get("command") or call["args"].get("cmd")
+        if cmd:
+            out.append(cmd)
+    return out
+
+
 def format_tool_args(args):
+    calls = decode_exec_script(args if isinstance(args, str) else "")
+    if calls:
+        lines = []
+        for call in calls:
+            lines.append(f"{call['tool']}:")
+            for key in sorted(call["args"], key=lambda k: (k not in (
+                    "command", "cmd", "workdir", "path", "file_path"), k)):
+                lines.append(f"  {key}: {call['args'][key]}")
+        return "\n".join(lines)
+
     parsed = maybe_parse_json(args)
     if not isinstance(parsed, dict):
         return stringify_details(parsed)
@@ -305,6 +403,11 @@ def format_tool_args(args):
 
 
 def summarize_tool_args(args):
+    commands = exec_commands(args if isinstance(args, str) else "")
+    if commands:
+        head = summarize_text(commands[0], 110)
+        return f"{head} (+{len(commands) - 1} more)" if len(commands) > 1 else head
+
     parsed = maybe_parse_json(args)
     if isinstance(parsed, dict):
         for key in ("cmd", "command", "url", "file_path", "path", "uri"):
@@ -444,7 +547,127 @@ def format_token_count(payload):
             )
     if info.get("model_context_window") is not None:
         lines.append(f"context_window={info['model_context_window']}")
+    limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+    if isinstance(limits, dict):
+        bits = []
+        if limits.get("plan_type"):
+            bits.append(f"plan={limits['plan_type']}")
+        primary = limits.get("primary") or {}
+        if primary.get("used_percent") is not None:
+            window = primary.get("window_minutes")
+            window_txt = f"/{round(window / 60)}h" if window else ""
+            bits.append(f"quota_used={primary['used_percent']:.0f}%{window_txt}")
+        if bits:
+            lines.append("rate_limits: " + ", ".join(bits))
     return "\n".join(lines)
+
+
+# --- Record families the older parser bucketed as generic "lifecycle" --------
+# All of these are present in current rollouts and each answers a question the
+# analyzer previously could not: which sub-agents ran, what was actually edited,
+# which MCP calls failed, where the context was compacted, and where a turn was
+# aborted or rolled back.
+
+def format_patch_apply(payload):
+    """The real record of what an edit changed, per file."""
+    changes = payload.get("changes")
+    lines = []
+    if isinstance(changes, dict):
+        for path, change in changes.items():
+            kind = (change or {}).get("type", "update") if isinstance(change, dict) else "update"
+            body = (change or {}).get("content") if isinstance(change, dict) else None
+            size = f" ({len(body)} chars)" if isinstance(body, str) else ""
+            lines.append(f"{kind:>6}: {path}{size}")
+    if payload.get("success") is not None:
+        lines.append(f"success={payload['success']}")
+    for field in ("stdout", "stderr"):
+        text = (payload.get(field) or "").strip()
+        if text:
+            lines.append(f"{field}: {summarize_text(text, 300)}")
+    return "\n".join(lines)
+
+
+def patch_files(payload):
+    changes = payload.get("changes")
+    return sorted(changes) if isinstance(changes, dict) else []
+
+
+def format_mcp_call(payload):
+    invocation = payload.get("invocation") or {}
+    lines = []
+    server = invocation.get("server")
+    tool = invocation.get("tool")
+    if server or tool:
+        lines.append(f"{server or '?'}.{tool or '?'}")
+    if payload.get("app_name"):
+        lines.append(f"app={payload['app_name']}")
+    args = invocation.get("arguments")
+    if args:
+        lines.append("arguments: " + summarize_text(stringify_details(args), 300))
+    duration = payload.get("duration") or {}
+    if isinstance(duration, dict) and duration.get("secs") is not None:
+        lines.append(f"duration={duration['secs']}s")
+    result = payload.get("result")
+    if isinstance(result, dict):
+        state = "Ok" if "Ok" in result else ("Err" if "Err" in result else "?")
+        lines.append(f"result={state}: "
+                     + summarize_text(stringify_details(result), 300))
+    return "\n".join(lines)
+
+
+def mcp_call_failed(payload):
+    """Transport-level Err, or an Ok payload whose body is an error.
+
+    An MCP call that reaches the server and comes back with a 404 in its text
+    is still a failed call from the session's point of view -- it just isn't a
+    failed *request*, so `Err` alone would miss it.
+    """
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return False
+    if "Err" in result:
+        return True
+    ok = result.get("Ok")
+    if isinstance(ok, dict):
+        structured = ok.get("structuredContent")
+        if isinstance(structured, dict) and structured.get("error"):
+            return True
+        if ok.get("isError"):
+            return True
+    return False
+
+
+def format_sub_agent_activity(payload):
+    parts = [f"kind={payload.get('kind') or '?'}"]
+    if payload.get("agent_path"):
+        parts.append(f"path={payload['agent_path']}")
+    if payload.get("agent_thread_id"):
+        parts.append(f"thread={payload['agent_thread_id']}")
+    return "\n".join(parts)
+
+
+def format_thread_settings(payload):
+    settings = payload.get("thread_settings") or {}
+    keep = ("model", "reasoning_effort", "reasoning_summary", "personality",
+            "approval_policy", "cwd")
+    return "\n".join(f"{k}={settings[k]}" for k in keep if settings.get(k))
+
+
+def format_compacted(payload):
+    history = payload.get("replacement_history")
+    count = len(history) if isinstance(history, list) else 0
+    message = (payload.get("message") or "").strip()
+    lines = [f"context compacted; replacement_history={count} messages"]
+    if message:
+        lines.append(summarize_text(message, 300))
+    return "\n".join(lines)
+
+
+def agent_name_from_path(agent_path):
+    """'/root/independent_audit' -> 'independent_audit'."""
+    if not agent_path:
+        return ""
+    return str(agent_path).rstrip("/").rsplit("/", 1)[-1]
 
 
 def agent_identity(meta):
@@ -499,6 +722,11 @@ def parse_session(path, max_chars=0, include_raw=False):
     previous_usage = empty_usage()
     events = []
     call_names = {}
+    files_changed = set()
+    mcp_calls = []
+    sub_agent_events = {}
+    interruptions = collections.Counter()
+    reasoning_effort = None
 
     # event_msg carries the canonical visible messages. response_item mirrors
     # those messages but also contains injected system/developer context.
@@ -524,10 +752,15 @@ def parse_session(path, max_chars=0, include_raw=False):
         raw="",
         event_type="",
         error=False,
+        raw_input="",
     ):
         events.append(
             {
                 "index": len(events),
+                # The undecoded tool input, kept so downstream consumers (the
+                # digest, the narrative) can re-parse exec scripts rather than
+                # regex the human-rendered `details`.
+                "raw_input": raw_input if isinstance(raw_input, str) else "",
                 "ts": format_ts(ts),
                 "epoch": ts.timestamp() if ts else 0,
                 "category": category,
@@ -641,6 +874,7 @@ def parse_session(path, max_chars=0, include_raw=False):
                     raw=raw_json,
                     event_type=EVENT_TOOL_USE,
                     error=str(payload.get("status", "")).lower() in ("failed", "error"),
+                    raw_input=args if isinstance(args, str) else "",
                 )
             elif item_type in TOOL_OUTPUT_TYPES:
                 output = payload.get("output") or payload.get("result") or ""
@@ -747,12 +981,97 @@ def parse_session(path, max_chars=0, include_raw=False):
                     raw=raw_json,
                     event_type=EVENT_LIFECYCLE,
                 )
+            elif item_type == "patch_apply_end":
+                files = patch_files(payload)
+                for path_changed in files:
+                    files_changed.add(path_changed)
+                ok = payload.get("success") is not False
+                add_event(
+                    ts,
+                    CATEGORY_TOOL,
+                    "event_msg",
+                    item_type,
+                    name="apply_patch",
+                    summary=("patch: " + ", ".join(Path(f).name for f in files[:3])
+                             + (f" (+{len(files) - 3})" if len(files) > 3 else "")
+                             ) if files else "patch",
+                    details=format_patch_apply(payload),
+                    raw=raw_json,
+                    event_type=EVENT_POST_TOOL,
+                    error=not ok,
+                )
+            elif item_type == "mcp_tool_call_end":
+                invocation = payload.get("invocation") or {}
+                label = f"{invocation.get('server') or '?'}.{invocation.get('tool') or '?'}"
+                failed = mcp_call_failed(payload)
+                mcp_calls.append({"tool": label, "failed": failed})
+                add_event(
+                    ts,
+                    CATEGORY_TOOL,
+                    "event_msg",
+                    item_type,
+                    name=label,
+                    summary=f"mcp {label}" + (" — failed" if failed else ""),
+                    details=format_mcp_call(payload),
+                    raw=raw_json,
+                    event_type=EVENT_POST_TOOL,
+                    error=failed,
+                )
+            elif item_type == "sub_agent_activity":
+                name = agent_name_from_path(payload.get("agent_path"))
+                thread_id = payload.get("agent_thread_id") or ""
+                if thread_id:
+                    entry = sub_agent_events.setdefault(
+                        thread_id, {"name": name, "thread_id": thread_id, "kinds": []}
+                    )
+                    entry["kinds"].append(payload.get("kind") or "")
+                    if name and not entry["name"]:
+                        entry["name"] = name
+                add_event(
+                    ts,
+                    CATEGORY_LIFECYCLE,
+                    "event_msg",
+                    item_type,
+                    name=name,
+                    summary=f"sub-agent {name or thread_id[:8]} {payload.get('kind') or ''}".strip(),
+                    details=format_sub_agent_activity(payload),
+                    raw=raw_json,
+                    event_type=EVENT_LIFECYCLE,
+                )
+            elif item_type == "thread_settings_applied":
+                settings = payload.get("thread_settings") or {}
+                if settings.get("model"):
+                    model = settings["model"]
+                if settings.get("reasoning_effort"):
+                    reasoning_effort = settings["reasoning_effort"]
+                add_event(
+                    ts,
+                    CATEGORY_LIFECYCLE,
+                    "event_msg",
+                    item_type,
+                    summary="settings: " + ", ".join(
+                        f"{k}={settings[k]}" for k in ("model", "reasoning_effort")
+                        if settings.get(k)
+                    ),
+                    details=format_thread_settings(payload),
+                    raw=raw_json,
+                    event_type=EVENT_LIFECYCLE,
+                )
+            elif item_type in ("context_compacted", "turn_aborted", "thread_rolled_back"):
+                interruptions[item_type] += 1
+                add_event(
+                    ts,
+                    CATEGORY_LIFECYCLE,
+                    "event_msg",
+                    item_type,
+                    summary=item_type.replace("_", " "),
+                    details=summarize_text(stringify_details(payload), 300),
+                    raw=raw_json,
+                    event_type=EVENT_LIFECYCLE,
+                    error=item_type in ("turn_aborted", "thread_rolled_back"),
+                )
             else:
-                category = CATEGORY_TOOL if item_type in (
-                    "patch_apply_end",
-                    "mcp_tool_call_end",
-                    "web_search_end",
-                ) else CATEGORY_LIFECYCLE
+                category = CATEGORY_TOOL if item_type == "web_search_end" else CATEGORY_LIFECYCLE
                 event_type = EVENT_POST_TOOL if category == CATEGORY_TOOL else EVENT_LIFECYCLE
                 add_event(
                     ts,
@@ -765,6 +1084,20 @@ def parse_session(path, max_chars=0, include_raw=False):
                     event_type=event_type,
                     error=str(payload.get("status", "")).lower() in ("failed", "error"),
                 )
+            continue
+
+        if outer_type == "compacted":
+            interruptions["compacted"] += 1
+            add_event(
+                ts,
+                CATEGORY_LIFECYCLE,
+                "compacted",
+                "compacted",
+                summary="context compacted",
+                details=format_compacted(payload),
+                raw=raw_json,
+                event_type=EVENT_LIFECYCLE,
+            )
             continue
 
         # Newer clients may add outer record families (for example world_state).
@@ -812,7 +1145,14 @@ def parse_session(path, max_chars=0, include_raw=False):
         "assistant_messages": assistant_messages,
         "tool_counts": tool_counts,
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "cli_version": cli_version,
+        "files_changed": sorted(files_changed),
+        "mcp_calls": mcp_calls,
+        "spawned_agents": sorted(
+            sub_agent_events.values(), key=lambda a: a.get("name") or ""
+        ),
+        "interruptions": dict(interruptions),
         "turn_count": counts_by_kind.get("task_started", 0),
         "token_usage": token_usage,
         "model_usage": dict(model_usage),
@@ -1089,8 +1429,9 @@ def format_overview(overview):
         lines.extend(
             [
                 "",
-                "  Cost is N/A because no public API price is available for: "
+                "  Cost is N/A because no price is configured for: "
                 + ", ".join(total["unknown_cost_models"]),
+                f"  Add rates to {pricing_mod.USER_FILE} to price them.",
             ]
         )
     lines.extend(
@@ -1123,6 +1464,7 @@ def generate_digest(session):
         lines.append(
             "- Cost unavailable for unpriced model(s): "
             + ", ".join(session["unknown_cost_models"])
+            + f" — add rates to `{pricing_mod.USER_FILE}`"
         )
     if session.get("agents"):
         lines.extend(["", "### By agent", ""])
@@ -1150,30 +1492,55 @@ def generate_digest(session):
         for index, text in enumerate(prompts[:10], 1):
             lines.append(f'{index}. "{summarize_text(text, 300)}"')
 
+    # Reasoning arrives as many overlapping summaries that repeat their earlier
+    # text verbatim, so "longest N" alone returns the same paragraph five times.
+    # Dedupe on the leading text before ranking.
     thinking = [event for event in session["events"] if event["event_type"] == EVENT_THINKING]
     if thinking:
-        lines.extend(["", "## Key Thinking/Decisions", ""])
-        for event in sorted(thinking, key=lambda item: len(item.get("details") or ""), reverse=True)[:5]:
-            lines.append(f"- {summarize_text(event.get('details') or event.get('summary'), 400)}")
+        seen_heads, distinct = set(), []
+        for event in sorted(
+            thinking, key=lambda item: len(item.get("details") or ""), reverse=True
+        ):
+            text = (event.get("details") or event.get("summary") or "").strip()
+            if not text:
+                continue
+            head = " ".join(text.split())[:120].lower()
+            if head in seen_heads or any(head in prior for prior in seen_heads):
+                continue
+            seen_heads.add(head)
+            distinct.append(text)
+            if len(distinct) == 5:
+                break
+        if distinct:
+            lines.extend(["", "## Key Thinking/Decisions", ""])
+            lines.extend(f"- {summarize_text(text, 400)}" for text in distinct)
 
-    commands = []
-    files = []
+    # Commands come from the decoded exec script, not from regexing the rendered
+    # details -- the old approach captured JSON fragments mid-string.
+    commands, files = [], []
     for event in session["events"]:
         if event["event_type"] != EVENT_TOOL_USE:
             continue
+        for command in exec_commands(event.get("raw_input") or ""):
+            flat = " ".join(command.split())
+            if flat and flat not in commands:
+                commands.append(flat[:200])
         details = event.get("details") or ""
-        command = re.search(r"(?:cmd|command):\s*(.+?)(?:\n|$)", details, re.I)
-        if command and command.group(1) not in commands:
-            commands.append(command.group(1)[:160])
-        for key in ("file_path", "path"):
-            match = re.search(rf"{key}:\s*(.+?)(?:\n|$)", details, re.I)
-            if match and match.group(1) not in files:
-                files.append(match.group(1))
+        for key in ("file_path", "path", "workdir"):
+            match = re.search(rf"^\s*{key}:\s*(.+?)$", details, re.I | re.M)
+            if match and match.group(1).strip() not in files:
+                files.append(match.group(1).strip())
+    for path_changed in session.get("files_changed") or []:
+        if path_changed not in files:
+            files.insert(0, path_changed)
     if commands:
         lines.extend(["", "## Commands Run", ""])
         lines.extend(f"- `{command}`" for command in commands[:15])
+    if session.get("files_changed"):
+        lines.extend(["", "## Files Modified (apply_patch)", ""])
+        lines.extend(f"- {path}" for path in session["files_changed"][:20])
     if files:
-        lines.extend(["", "## Files Referenced/Modified", ""])
+        lines.extend(["", "## Files/Paths Referenced", ""])
         lines.extend(f"- {path}" for path in files[:15])
 
     errors = [
@@ -1223,9 +1590,11 @@ def build_html(session, sessions):
     unknown_note = ""
     if session.get("unknown_cost_models"):
         unknown_note = (
-            '<div class="cost-note">No public rate for '
+            '<div class="cost-note">No price configured for '
             + html.escape(", ".join(session["unknown_cost_models"]))
-            + "; cost shown as N/A.</div>"
+            + "; add rates to <code>"
+            + html.escape(str(pricing_mod.USER_FILE))
+            + "</code>.</div>"
         )
 
     return f"""<!doctype html>
@@ -1340,10 +1709,32 @@ def main():
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME), help="Codex state directory")
     parser.add_argument("--sessions-dir", help="Override active rollout directory")
     parser.add_argument("--archived-dir", help="Override archived rollout directory (empty string disables)")
-    parser.add_argument("--max-chars", type=int, default=0, help="Truncate event details (0 = unlimited)")
+    parser.add_argument("--max-chars", type=int, default=None,
+                        help="Truncate event details (0 = unlimited; default 4000 for HTML)")
     parser.add_argument("--raw", action="store_true", help="Include raw JSON records in detailed output")
     parser.add_argument("--no-raw", action="store_true", help="Do not include raw JSON (default)")
+    parser.add_argument("--pricing-file", help="Extra pricing JSON, overriding the defaults")
+    parser.add_argument("--pricing", action="store_true",
+                        help="Show the resolved price table and where it came from")
     args = parser.parse_args()
+
+    get_pricing(args.pricing_file)
+    if args.pricing:
+        table = get_pricing()
+        print(f"sources: {table.describe()}")
+        for key in sorted(table.models):
+            rates = table.rates(key.rstrip("*"))
+            if rates:
+                print(f"  {key:<26} in {rates['input']:>7.3f}  out {rates['output']:>7.3f}  "
+                      f"cache_read {rates['cache_read']:>7.3f}")
+        return 0
+
+    # A whole session of untruncated tool output renders a multi-megabyte page
+    # that browsers struggle with, and nobody reads a 200KB blob in a timeline
+    # card anyway. Cap HTML by default; JSON and explicit --max-chars are
+    # untouched, so the full data is always one flag away.
+    if args.max_chars is None:
+        args.max_chars = 4000 if args.output == "html" else 0
 
     codex_home = Path(args.codex_home).expanduser()
     sessions_dir = Path(args.sessions_dir).expanduser() if args.sessions_dir else codex_home / "sessions"

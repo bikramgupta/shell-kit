@@ -13,6 +13,10 @@
 #   codex-session-analyzer --output json        # Normalized machine-readable trace
 #   codex-session-analyzer <session-id>        # Analyze specific session
 #   codex-session-analyzer <session-id> --open # Open specific session in browser
+#   codex-session-analyzer --pricing           # Resolved price table + where it came from
+#
+# Companion tool (separate symlink):
+#   codex-session-narrative [id] [--text]      # Turn-by-turn replay of one session
 
 # Resolve symlinks to find actual script location
 SOURCE="${BASH_SOURCE[0]}"

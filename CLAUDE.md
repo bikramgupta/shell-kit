@@ -65,9 +65,29 @@ zshrc                    # Loader + Homebrew + completions + starship + zsh plug
   config.toml            # Managed Codex model + native OTEL settings (merged on deploy)
   tools/merge_config.py  # Preserves app/plugin/MCP state while merging managed keys
   tools/session-analyzer/ # Root/sub-agent history, trace, token, model, and cost analysis
+                          #   narrative.py = turn-by-turn replay of a Codex session
+shared/
+  pricing/models.json    # Model prices as DATA (both providers) — not hardcoded in either tool
+  pricing/pricing.py     # Price loader; the one thing the two adapters share
 docs/
   OBSERVABILITY.md       # Observability vision + two-plane / three-tier guide
 ```
+
+## Pricing is data, not code
+
+Neither analyzer hardcodes model prices. `shared/pricing/models.json` is the
+shipped default; `deploy.sh` copies it next to each tool so installs are
+self-contained. Sources merge, later winning:
+
+1. `models.json` shipped beside the analyzer
+2. `~/.config/ai-tools/pricing.json` — your overrides; **never** touched by deploy
+3. `$AI_MODEL_PRICING`
+4. `--pricing-file FILE`
+
+A model with no configured price is reported **N/A and named**, never charged at
+a neighbouring model's rate — a confident wrong number is worse than an honest
+gap. `claude-session-analyzer --pricing` / `codex-session-analyzer --pricing`
+shows the resolved table and its sources.
 
 ## Help Commands
 
@@ -77,6 +97,7 @@ docs/
 - `claude-session-analyzer --help` - Claude session analysis tool
 - `claude-workflow-analyzer --help` - Describe dynamic workflow runs (wf_*.json)
 - `codex-session-analyzer --help` - Codex session analysis tool
+- `codex-session-narrative --help` - Read a Codex session turn by turn
 - `ai-telemetry help` - Shared Grafana/OTEL control (`ai-obs`; provider-specific names work)
 
 Most functions also support `--help` flag:
@@ -134,6 +155,11 @@ myproject/
 - `codex-session-analyzer <id> --overview` - Root/sub-agent topology and token/model totals
 - `codex-session-analyzer <id> --path` - Resolve a transcript path
 - `codex-session-analyzer --project /path --list` - Filter history to an exact project cwd
+- `codex-session-analyzer --pricing` - Show the resolved price table and its sources
+- `codex-session-narrative <id>` - Read a Codex session as a story: prompt → tool calls →
+  what each returned → reply. Flags failures, inferred retries, oversized results, plus
+  compaction, aborts, and sub-agent spawns inline. Turn boundaries are exact (`turn_id`).
+  Opens a self-contained HTML page; `--text` renders it in the terminal.
 
 **Telemetry (Tier 3):**
 - `ai-telemetry up` - Start shared OTEL + Prometheus + Grafana (Grafana at :3000)

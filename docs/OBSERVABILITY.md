@@ -51,7 +51,7 @@ durable history. Use the lowest tier that answers your question.
 | Tier | What | Setup | Answers | Authoritative? |
 |------|------|-------|---------|----------------|
 | **1 — Live** | native client usage/context UI; Claude `/usage`, `/cost`, statusline | none | current task, right now | Provider-native |
-| **2 — Offline** | `claude-session-analyzer` / `codex-session-analyzer` | none (reads local transcripts) | per-session / per-agent / per-model token + cost for any past session | Estimate |
+| **2 — Offline** | `claude-session-analyzer` / `codex-session-analyzer` (+ the matching `-narrative` tools) | none (reads local transcripts) | per-session / per-agent / per-model token + cost for any past session, and a turn-by-turn replay of what happened inside one | Estimate |
 | **3 — Historical** | shared OTEL → Prometheus → Grafana stack | `ai-telemetry up` (Docker) | token/model/tool/agent trends across *all* tasks | Native exported metrics |
 
 ### Tier 1 — Live (native)
@@ -80,6 +80,27 @@ codex-session-analyzer  --overview             # root + linked sub-agents + mode
 codex-session-analyzer  --open                 # combined agent-filterable HTML trace
 codex-session-analyzer  --project /path --list # exact cwd history filter
 ```
+
+Both providers also have a **narrative** view — the same session read as a story rather
+than an event list, which is the view that answers *"where did the time and tokens
+actually go?"*:
+
+```bash
+claude-session-narrative --latest              # prompt → tools → what returned → reply
+codex-session-narrative  --latest              # same, for Codex
+codex-session-narrative  <id> --text           # terminal rendering instead of HTML
+```
+
+Each turn shows its prompt, reasoning, every tool call with latency and pass/fail, what
+came back, and per-turn tokens and cost. Both flag failures, **inferred** retries (a
+failed call followed by a near-identical one — nothing in either transcript records a
+retry), and results heavier than that session's own p90. The Codex narrative additionally
+marks compaction, aborted turns, thread rollbacks, and sub-agent spawns inline.
+
+One structural difference worth knowing: Codex stamps `turn_id` on every reasoning,
+message, tool-call and patch record, so its turn boundaries are read directly. Claude's
+transcript has no such field, so its narrative resolves each entry to the owning prompt
+through the `parentUuid` chain.
 
 How the numbers are built:
 
@@ -153,8 +174,17 @@ what's my model mix and edit-acceptance trend?"*
 
 ## Maintenance
 
-- **Pricing tables** (Tier 2) live in each analyzer's `parser.py`. When Anthropic/OpenAI
-  change rates, update the per-MTok dicts. They're clearly labeled estimates.
+- **Pricing** (Tier 2) is **data, not code**: `shared/pricing/models.json`, deployed next
+  to each analyzer. When Anthropic/OpenAI change rates, edit that file — or better, your
+  own `~/.config/ai-tools/pricing.json`, which overrides it and survives `deploy.sh`.
+  Check what's in effect with `--pricing` on either analyzer.
+
+  A model with no configured price is reported **N/A and named**, never charged at a
+  neighbouring model's rate. This matters in practice: internal slugs (`gpt-5.6-sol`) have
+  no public price, and the Claude analyzer previously fell back to Opus rates for anything
+  it didn't recognize — which produced confident, plausible, wrong numbers for every new
+  model. Wildcards are suffix-safe (`gpt-5*` will not absorb `gpt-5.6`) so a new minor
+  version stays visibly unpriced instead of silently inheriting the old rate.
 - **Metric names** (Tier 3) — re-verify against Claude's
   [monitoring-usage docs](https://code.claude.com/docs/en/monitoring-usage) and Codex's
   [OTEL catalog](https://learn.chatgpt.com/docs/config-file/config-advanced#observability-and-telemetry)
