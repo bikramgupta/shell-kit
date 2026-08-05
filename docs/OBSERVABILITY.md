@@ -185,6 +185,11 @@ what's my model mix and edit-acceptance trend?"*
   it didn't recognize — which produced confident, plausible, wrong numbers for every new
   model. Wildcards are suffix-safe (`gpt-5*` will not absorb `gpt-5.6`) so a new minor
   version stays visibly unpriced instead of silently inheriting the old rate.
+- **The Codex index cache** (Tier 2) lives at `~/.cache/codex-session-analyzer/`, keyed per
+  rollout on `(size, mtime_ns)`. It is a pure accelerator — deleting it costs one slower
+  run, never a wrong answer, and `--no-cache` / `--refresh` bypass it. Selection reads a
+  cheap scan of each rollout; only the session you actually asked for is fully parsed, and
+  `--list` / `--path` / `--overview` never parse one at all.
 - **Metric names** (Tier 3) — re-verify against Claude's
   [monitoring-usage docs](https://code.claude.com/docs/en/monitoring-usage) and Codex's
   [OTEL catalog](https://learn.chatgpt.com/docs/config-file/config-advanced#observability-and-telemetry)

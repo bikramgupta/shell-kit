@@ -14,6 +14,11 @@
 #   codex-session-analyzer <session-id>        # Analyze specific session
 #   codex-session-analyzer <session-id> --open # Open specific session in browser
 #   codex-session-analyzer --pricing           # Resolved price table + where it came from
+#   codex-session-analyzer --refresh --list    # Rescan every rollout, ignore the index cache
+#
+# Session selection reads a cached scan index (~/.cache/codex-session-analyzer/)
+# rather than fully parsing every rollout. --no-cache disables it; results are
+# identical either way.
 #
 # Companion tool (separate symlink):
 #   codex-session-narrative [id] [--text]      # Turn-by-turn replay of one session

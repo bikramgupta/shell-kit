@@ -156,6 +156,9 @@ myproject/
 - `codex-session-analyzer <id> --path` - Resolve a transcript path
 - `codex-session-analyzer --project /path --list` - Filter history to an exact project cwd
 - `codex-session-analyzer --pricing` - Show the resolved price table and its sources
+- `codex-session-analyzer --refresh` - Rescan every rollout, ignoring the index cache
+  (selection normally reads a cached scan in `~/.cache/codex-session-analyzer/`, so only
+  the session you ask for is fully parsed; `--no-cache` opts out entirely)
 - `codex-session-narrative <id>` - Read a Codex session as a story: prompt → tool calls →
   what each returned → reply. Flags failures, inferred retries, oversized results, plus
   compaction, aborts, and sub-agent spawns inline. Turn boundaries are exact (`turn_id`).

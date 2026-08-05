@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -1168,6 +1169,240 @@ def parse_session(path, max_chars=0, include_raw=False):
     }
 
 
+# Bump when scan_session's output shape or accounting changes; entries written
+# by an older version are ignored rather than trusted.
+SCAN_SCHEMA_VERSION = 1
+
+
+def scan_session(path):
+    """Selection-level metadata for one rollout: no events, no formatting.
+
+    parse_session builds a formatted event object for every record, which costs
+    ~14ms per rollout. Loading every session that way to pick one of them meant
+    every invocation paid ~25s regardless of the argument. Everything session
+    selection actually needs -- id, parent, cwd, timestamps, model, turn count
+    and token totals -- is cheap, so it lives here, and the expensive parse
+    runs only on the session the user asked for.
+
+    Token accounting is deliberately identical to parse_session: cumulative
+    total_token_usage snapshots, positive deltas attributed to the model active
+    at that point. Diverging here would make --list disagree with --overview.
+    """
+    meta = {}
+    first_ts = None
+    last_ts = None
+    model = None
+    reasoning_effort = None
+    token_usage = empty_usage()
+    model_usage = collections.defaultdict(empty_usage)
+    previous_usage = empty_usage()
+    turn_count = 0
+    summary_text = ""
+
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+
+            ts = parse_ts(record.get("timestamp"))
+            if ts:
+                first_ts = min(first_ts, ts) if first_ts else ts
+                last_ts = max(last_ts, ts) if last_ts else ts
+
+            outer_type = record.get("type")
+            payload = record.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+
+            if outer_type == "session_meta":
+                if not meta:
+                    meta = payload
+                continue
+
+            if outer_type == "turn_context":
+                model = payload.get("model") or model
+                continue
+
+            # The first non-instruction user message is the list summary. It is
+            # mirrored into both families, so whichever lands first wins and the
+            # text is the same either way.
+            if outer_type == "response_item":
+                if (
+                    not summary_text
+                    and payload.get("type") == "message"
+                    and payload.get("role") == "user"
+                ):
+                    text = extract_text(payload.get("content"))
+                    if text and not is_instruction_text(text):
+                        summary_text = text
+                continue
+
+            if outer_type != "event_msg":
+                continue
+
+            item_type = payload.get("type")
+            if item_type == "token_count":
+                info = payload.get("info") or {}
+                total = normalize_usage(info.get("total_token_usage"))
+                last = normalize_usage(info.get("last_token_usage"))
+                if usage_has_tokens(total):
+                    delta = usage_delta(total, previous_usage, last)
+                    if usage_has_tokens(delta):
+                        active_model = model or "unknown"
+                        model_usage[active_model] = add_usage(model_usage[active_model], delta)
+                    token_usage = total
+                    previous_usage = total
+            elif item_type == "task_started":
+                turn_count += 1
+            elif item_type == "user_message":
+                text = payload.get("message") or ""
+                if not summary_text and text and not is_instruction_text(text):
+                    summary_text = text
+            elif item_type == "thread_settings_applied":
+                settings = payload.get("thread_settings") or {}
+                if settings.get("model"):
+                    model = settings["model"]
+                if settings.get("reasoning_effort"):
+                    reasoning_effort = settings["reasoning_effort"]
+
+    if not usage_has_tokens(token_usage) and model_usage:
+        for usage in model_usage.values():
+            token_usage = add_usage(token_usage, usage)
+    if usage_has_tokens(token_usage) and not model_usage:
+        model_usage[model or "unknown"] = token_usage
+
+    identity = agent_identity(meta)
+    estimated_cost, unknown_cost_models = estimate_model_usage(model_usage)
+    return {
+        "id": meta.get("id") or Path(path).stem.replace("rollout-", ""),
+        "parent_id": identity["parent_id"],
+        "is_subagent": identity["is_subagent"],
+        "agent_label": identity["agent_label"],
+        "agent_role": identity["agent_role"],
+        "agent_depth": identity["agent_depth"],
+        "path": str(path),
+        "archived": "archived_sessions" in Path(path).parts,
+        "cwd": meta.get("cwd"),
+        "start_ts": first_ts,
+        "end_ts": last_ts,
+        "duration": format_duration(first_ts, last_ts),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "cli_version": meta.get("cli_version"),
+        "turn_count": turn_count,
+        "token_usage": token_usage,
+        "model_usage": dict(model_usage),
+        "estimated_cost": estimated_cost,
+        "unknown_cost_models": unknown_cost_models,
+        "summary": summarize_text(summary_text),
+        "agent_count": 1,
+        "scanned": True,
+    }
+
+
+def cache_path(sessions_dir, archived_dir):
+    """One cache file per (sessions, archived) pair, so --codex-home and
+    --sessions-dir overrides never read each other's index."""
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    key = hashlib.sha1(
+        f"{Path(sessions_dir).expanduser()}|{Path(archived_dir).expanduser() if archived_dir else ''}".encode()
+    ).hexdigest()[:16]
+    return root / "codex-session-analyzer" / f"index-{key}.json"
+
+
+def _cache_encode(record):
+    encoded = dict(record)
+    for key in ("start_ts", "end_ts"):
+        value = encoded.get(key)
+        encoded[key] = value.isoformat() if isinstance(value, dt.datetime) else None
+    return encoded
+
+
+def _cache_decode(record):
+    decoded = dict(record)
+    for key in ("start_ts", "end_ts"):
+        decoded[key] = parse_ts(decoded.get(key))
+    return decoded
+
+
+def load_index(sessions_dir, archived_dir, use_cache=True, refresh=False):
+    """Scan records for every rollout, reusing cached ones where the file is
+    unchanged.
+
+    Rollouts are append-only and almost all of them are finished history, so
+    (size, mtime_ns) is a sound freshness key: a session still being written
+    changes both. Cache problems are never fatal -- any failure falls back to
+    scanning, because a slow correct answer beats a fast broken one.
+    """
+    files = list(iter_session_files(sessions_dir, archived_dir))
+    cached = {}
+    path = cache_path(sessions_dir, archived_dir)
+    if use_cache and not refresh:
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+            if blob.get("version") == SCAN_SCHEMA_VERSION:
+                cached = blob.get("entries") or {}
+        except (OSError, ValueError):
+            cached = {}
+
+    sessions = []
+    fresh = {}
+    changed = False
+    for file_path in files:
+        try:
+            stat = os.stat(file_path)
+        except OSError as error:
+            print(f"warning: cannot stat {file_path}: {error}", file=sys.stderr)
+            continue
+        entry = cached.get(file_path)
+        if entry and entry.get("size") == stat.st_size and entry.get("mtime_ns") == stat.st_mtime_ns:
+            fresh[file_path] = entry
+            sessions.append(_cache_decode(entry["record"]))
+            continue
+        try:
+            record = scan_session(file_path)
+        except OSError as error:
+            print(f"warning: cannot read {file_path}: {error}", file=sys.stderr)
+            continue
+        sessions.append(record)
+        fresh[file_path] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "record": _cache_encode(record),
+        }
+        changed = True
+
+    # Rewrite when anything was rescanned or any stale entry dropped, so a
+    # deleted rollout does not linger in the index forever.
+    if use_cache and (changed or len(fresh) != len(cached)):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(
+                json.dumps({"version": SCAN_SCHEMA_VERSION, "entries": fresh}),
+                encoding="utf-8",
+            )
+            os.replace(temp, path)
+        except OSError:
+            pass
+    return sessions
+
+
+def hydrate(session, max_chars=0, include_raw=False):
+    """Upgrade a scan record to a fully parsed one, in place of the original."""
+    if not session or not session.get("scanned"):
+        return session
+    try:
+        return parse_session(session["path"], max_chars=max_chars, include_raw=include_raw)
+    except OSError as error:
+        print(f"warning: cannot read {session['path']}: {error}", file=sys.stderr)
+        return session
+
+
 def session_sort_key(session):
     value = session.get("start_ts")
     if value:
@@ -1248,12 +1483,14 @@ def combine_thread(root, sessions):
                 "path": member["path"],
             }
         )
-        for event in member["events"]:
+        # Members may be scan records (no events) when only the rolled-up
+        # numbers are wanted -- --list and --overview never read the timeline.
+        for event in member.get("events") or []:
             copied = dict(event)
             copied["agent_label"] = label
             copied["agent_role"] = member["agent_role"]
             events.append(copied)
-        tool_counts.update(member["tool_counts"])
+        tool_counts.update(member.get("tool_counts") or {})
         usage = add_usage(usage, member["token_usage"])
         for model, model_tokens in member["model_usage"].items():
             model_usage[model] = add_usage(model_usage[model], model_tokens)
@@ -1269,7 +1506,7 @@ def combine_thread(root, sessions):
         {
             "start_ts": min(starts) if starts else root.get("start_ts"),
             "end_ts": max(ends) if ends else root.get("end_ts"),
-            "duration": format_duration(min(starts), max(ends)) if starts and ends else root["duration"],
+            "duration": format_duration(min(starts), max(ends)) if starts and ends else root.get("duration"),
             "events": events,
             "tool_counts": tool_counts,
             "token_usage": usage,
@@ -1713,6 +1950,10 @@ def main():
                         help="Truncate event details (0 = unlimited; default 4000 for HTML)")
     parser.add_argument("--raw", action="store_true", help="Include raw JSON records in detailed output")
     parser.add_argument("--no-raw", action="store_true", help="Do not include raw JSON (default)")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Rescan every rollout, ignoring the cached index")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Do not read or write the index cache")
     parser.add_argument("--pricing-file", help="Extra pricing JSON, overriding the defaults")
     parser.add_argument("--pricing", action="store_true",
                         help="Show the resolved price table and where it came from")
@@ -1746,15 +1987,18 @@ def main():
         print(f"No Codex session directories found under {codex_home}", file=sys.stderr)
         return 1
 
-    sessions = load_sessions(
+    # Selection runs off cheap scan records; only the chosen session gets the
+    # expensive parse. See scan_session/load_index for why.
+    sessions = load_index(
         sessions_dir,
         archived_dir,
-        max_chars=args.max_chars,
-        include_raw=args.raw and not args.no_raw,
+        use_cache=not args.no_cache,
+        refresh=args.refresh,
     )
     if not sessions:
         print("No Codex sessions found", file=sys.stderr)
         return 1
+    include_raw = args.raw and not args.no_raw
 
     if args.list:
         selected = [session for session in sessions if args.all or not session["is_subagent"]]
@@ -1775,7 +2019,8 @@ def main():
         path = str(Path(args.session_id).expanduser().resolve())
         session = next((item for item in sessions if str(Path(item["path"]).resolve()) == path), None)
         if not session:
-            session = parse_session(path, args.max_chars, args.raw and not args.no_raw)
+            # A rollout outside the scanned directories: parse it directly.
+            session = parse_session(path, args.max_chars, include_raw)
             sessions.append(session)
     elif args.session_id:
         session, matches = select_session(sessions, args.session_id)
@@ -1798,15 +2043,28 @@ def main():
             print(f"No root Codex session found for {scope}", file=sys.stderr)
         return 1
 
-    # A selected child is useful on its own; a selected root includes descendants.
-    combined = combine_thread(session, sessions)
     if args.path:
         print(session["path"])
         return 0
+
+    # --overview reports topology and totals, never the timeline, so scan
+    # records answer it in full -- no rollout is parsed for it.
     if args.overview or args.agents:
         overview = build_overview(session, sessions)
         output = json.dumps(serializable(overview), indent=2) if args.output == "json" else format_overview(overview)
         return write_or_print(output, args)
+
+    # Everything below renders events, so the selected thread -- and only it --
+    # gets fully parsed.
+    members = {item["path"] for item in [session] + descendants(session, sessions)}
+    sessions = [
+        hydrate(item, args.max_chars, include_raw) if item["path"] in members else item
+        for item in sessions
+    ]
+    session = next(item for item in sessions if item["path"] == session["path"])
+
+    # A selected child is useful on its own; a selected root includes descendants.
+    combined = combine_thread(session, sessions)
     if args.digest:
         return write_or_print(generate_digest(combined), args)
     if args.output == "json":

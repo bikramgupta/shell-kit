@@ -25,9 +25,35 @@ codex-session-analyzer <id> --digest           # markdown continuation digest
 codex-session-analyzer <id> --open             # combined HTML trace with agent filter
 codex-session-analyzer <id> --output json      # normalized machine-readable trace
 codex-session-analyzer --pricing               # resolved price table + where it came from
+codex-session-analyzer --refresh --list        # rescan every rollout, ignore the cache
+codex-session-analyzer --no-cache --list       # never read or write the cache
 ```
 
 IDs may be unique prefixes. A rollout JSONL path can be passed directly.
+
+### Why it is fast
+
+Selecting a session used to cost ~25s no matter what you asked for, because
+every rollout was fully parsed — building a formatted event object per record —
+just to find the one you wanted. Two changes fixed that:
+
+- **Two-tier parsing.** A cheap scan reads only what selection needs (id,
+  parent, cwd, timestamps, model, turn count, token totals). The expensive
+  parse runs on the selected session and its descendants, and only for the
+  modes that render a timeline. `--list`, `--path` and `--overview` never
+  trigger it.
+- **An index cache** at `~/.cache/codex-session-analyzer/`, keyed per rollout on
+  `(size, mtime_ns)`. Rollouts are append-only, so an unchanged file is reused
+  and a growing one is rescanned. New sessions cost only their own scan, so
+  this keeps working as history grows.
+
+On ~2,100 rollouts (1.3 GB): **~25s → 5s cold, ~0.15s warm.** The cache is a
+pure accelerator — delete it, corrupt it, or pass `--no-cache` and you get the
+same answers, just slower. Any cache error falls back to scanning rather than
+failing.
+
+The scan reproduces parse_session's token accounting exactly rather than
+approximating it, so `--list` can never disagree with `--overview`.
 
 ## codex-session-narrative
 
