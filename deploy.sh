@@ -239,6 +239,21 @@ LOCAL_CLAUDE_DIR="$SCRIPT_DIR/.claude"
 HOME_CLAUDE_DIR="$HOME/.claude"
 CLAUDE_BACKUP_DIR="$HOME/.claude-backup/$(date +%Y%m%d_%H%M%S)"
 
+# Model prices are shared data, not adapter code. Copy the loader + the price
+# table next to each analyzer so an installed tool is self-contained and does
+# not reach back into this repo. Both analyzers look for these as siblings
+# first, then fall back to shared/pricing/ when run from a checkout.
+#
+# Only these two files are copied. A user's own rates live in
+# ~/.config/ai-tools/pricing.json, which deploy never writes, so re-running
+# deploy.sh can never clobber prices you added.
+deploy_pricing() {
+  local dest="$1"
+  local src="$SCRIPT_DIR/shared/pricing"
+  [[ -d "$src" && -d "$dest" ]] || return 0
+  cp "$src/pricing.py" "$src/models.json" "$dest/" 2>/dev/null || true
+}
+
 backup_claude_settings() {
   # Only backup if there are existing settings
   if [[ -f "$HOME_CLAUDE_DIR/settings.json" ]] || [[ -f "$HOME_CLAUDE_DIR/CLAUDE.md" ]]; then
@@ -328,6 +343,7 @@ deploy_claude_settings() {
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/workflow.py" 2>/dev/null || true
     chmod +x "$HOME_CLAUDE_DIR/tools/session-analyzer/narrative.py" 2>/dev/null || true
+    deploy_pricing "$HOME_CLAUDE_DIR/tools/session-analyzer"
     echo -e "  ${GREEN}Deployed:${NC} ~/.claude/tools/"
   fi
 
@@ -394,16 +410,23 @@ deploy_codex_settings() {
     cp -r "$LOCAL_CODEX_DIR/tools/"* "$HOME_CODEX_DIR/tools/" 2>/dev/null || true
     chmod +x "$HOME_CODEX_DIR/tools/session-analyzer/analyze.sh" 2>/dev/null || true
     chmod +x "$HOME_CODEX_DIR/tools/session-analyzer/parser.py" 2>/dev/null || true
+    chmod +x "$HOME_CODEX_DIR/tools/session-analyzer/narrative.py" 2>/dev/null || true
     chmod +x "$HOME_CODEX_DIR/tools/merge_config.py" 2>/dev/null || true
+    deploy_pricing "$HOME_CODEX_DIR/tools/session-analyzer"
     echo -e "  ${GREEN}Deployed:${NC} ~/.codex/tools/"
   fi
 
-  # Symlink for session-analyzer CLI
+  # Symlinks for session-analyzer + narrative CLIs
   mkdir -p "$HOME/.local/bin"
   local analyzer="$HOME_CODEX_DIR/tools/session-analyzer/analyze.sh"
   if [[ -f "$analyzer" ]]; then
     ln -sf "$analyzer" "$HOME/.local/bin/codex-session-analyzer"
     echo -e "  ${GREEN}Symlinked:${NC} codex-session-analyzer -> ~/.local/bin/"
+  fi
+  local codex_narrative="$HOME_CODEX_DIR/tools/session-analyzer/narrative.py"
+  if [[ -f "$codex_narrative" ]]; then
+    ln -sf "$codex_narrative" "$HOME/.local/bin/codex-session-narrative"
+    echo -e "  ${GREEN}Symlinked:${NC} codex-session-narrative -> ~/.local/bin/"
   fi
 
   echo ""
@@ -489,4 +512,5 @@ echo "  claude-session-analyzer  - Analyze Claude sessions (tokens + cost)"
 echo "  claude-workflow-analyzer - Describe dynamic workflow runs (wf_*.json)"
 echo "  claude-session-narrative - Read a session turn by turn (prompt -> tools -> reply)"
 echo "  codex-session-analyzer   - Analyze Codex sessions (tokens + cost)"
+echo "  codex-session-narrative  - Read a Codex session turn by turn (prompt -> tools -> reply)"
 echo "  ai-telemetry help        - Shared Claude + Codex OTEL/Grafana stack (ai-obs)"

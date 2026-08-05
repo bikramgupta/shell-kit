@@ -183,13 +183,37 @@ The analyzer:
 6. Builds unified timeline with accurate agent attribution
 7. Generates interactive HTML or JSON output
 
+## Pricing
+
+Prices are **data, not code**. `models.json` sits next to the analyzer; sources
+merge in this order, later winning:
+
+1. `models.json` shipped beside the analyzer
+2. `~/.config/ai-tools/pricing.json` — your overrides; survives `deploy.sh`
+3. `$AI_MODEL_PRICING`
+4. `--pricing-file FILE`
+
+`claude-session-analyzer --pricing` prints the resolved table and its sources.
+
+A model with **no configured price contributes 0 and is named** in the output.
+This used to fall back to Opus rates for anything unrecognized, which meant every
+newly released model was silently mispriced — and looked perfectly plausible
+while doing it. An honest gap beats a confident wrong number.
+
+Wildcards are suffix-safe: `claude-opus-5*` matches `claude-opus-5-20260101` and
+`claude-opus-5[1m]`, but a hypothetical `claude-opus-6` stays unpriced until you
+price it rather than inheriting Opus 5's rate.
+
 ## Files
 
 ```
 ~/.claude/tools/session-analyzer/
 ├── analyze.sh      # CLI entry point (handles symlinks)
 ├── parser.py       # Core parsing and HTML generation
+├── narrative.py    # claude-session-narrative: turn-by-turn session replay
 ├── workflow.py     # claude-workflow-analyzer: describe wf_*.json workflow runs
+├── pricing.py      # Shared price loader (copied from shared/pricing/ by deploy.sh)
+├── models.json     # Shipped default price table
 ├── templates/      # (reserved for future templates)
 └── README.md       # This file
 ```

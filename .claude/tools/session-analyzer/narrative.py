@@ -47,9 +47,18 @@ from parser import find_session_files  # noqa: E402  (session-id resolution)
 
 TOK_PER_CHAR = 0.25          # result bytes -> approx tokens
 HEAVY_FLOOR = 1200           # a "heavy" result is at least this many tokens
-# Estimated USD per 1M tokens. Estimates only — /cost is authoritative.
-PRICE = {"in": 5.0, "cache_write": 6.25, "cache_read": 0.5, "out": 25.0}
 TOKEN_KEYS = ("in", "cache_write", "cache_read", "out")
+
+# Prices come from shared/pricing/models.json (see parser.py). This used to be
+# one hardcoded rate applied to every model, which quietly billed a Haiku
+# subagent at Opus rates; cost is now resolved per turn from that turn's model.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from parser import get_pricing, pricing_mod  # noqa: E402
+
+# Buckets here are named for the transcript's usage fields; map them onto the
+# shared pricing buckets.
+_BUCKET = {"in": "input", "cache_write": "cache_write",
+           "cache_read": "cache_read", "out": "output"}
 
 
 # ===========================================================================
@@ -94,8 +103,13 @@ def clip(text, n):
     return (cut[:sp] if sp > n * 0.5 else cut).rstrip(" ,;:-") + "…"
 
 
-def cost_of(t):
-    return sum(t[k] * PRICE[k] for k in TOKEN_KEYS) / 1e6
+def cost_of(t, model):
+    """USD for one turn's tokens at that turn's own model rate.
+
+    Returns None when the model has no configured price, so an unpriced turn
+    reads as unknown rather than free.
+    """
+    return get_pricing().cost(model, {_BUCKET[k]: t[k] for k in TOKEN_KEYS})
 
 
 def zero_tokens():
@@ -472,8 +486,19 @@ def build(path):
 
     all_ts = [ts(e) for e in entries if ts(e)]
     session_tokens = zero_tokens()
+    session_cost = 0.0
+    unpriced = set()
     for t in turns:
         add_tokens(session_tokens, t["tokens"])
+        # Cost per turn, at that turn's model — a session that switched models
+        # (or fanned out to a cheaper subagent) is not one flat rate.
+        turn_cost = cost_of(t["tokens"], t["model"])
+        t["cost"] = turn_cost
+        if turn_cost is None:
+            if any(t["tokens"][k] for k in TOKEN_KEYS):
+                unpriced.add(t["model"] or "unknown")
+        else:
+            session_cost += turn_cost
 
     return {
         "session_id": Path(path).stem,
@@ -484,7 +509,8 @@ def build(path):
         "end": max(all_ts) if all_ts else "",
         "turns": turns,
         "tokens": session_tokens,
-        "cost": cost_of(session_tokens),
+        "cost": session_cost,
+        "unpriced_models": sorted(unpriced),
     }
 
 
@@ -664,6 +690,9 @@ def render_text(d, heavy):
              "'uncached' stays tiny.")
     L.append("Result sizes are estimated from returned bytes; cost is an "
              "estimate — /cost is authoritative.")
+    if d.get("unpriced_models"):
+        L.append("Cost excludes " + ", ".join(d["unpriced_models"])
+                 + f" (no price configured; add rates to {pricing_mod.USER_FILE}).")
     return "\n".join(L)
 
 

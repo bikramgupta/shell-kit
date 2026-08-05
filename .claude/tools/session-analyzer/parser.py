@@ -423,41 +423,61 @@ def list_sessions(project_path: Optional[str] = None, fallback_global: bool = Tr
 # ---------------------------------------------------------------------------
 # Token & cost accounting
 #
-# Estimated USD prices per 1,000,000 tokens. These are ESTIMATES for local
-# accounting only. Run /cost in a session, or use the Anthropic Usage & Cost
-# API, for authoritative billing. Update these when Anthropic pricing changes.
-# Convention (Anthropic prompt caching): cache write = 1.25x input (5m TTL),
-# cache read = 0.10x input.
+# Prices are DATA, not code: they live in models.json and merge from the shipped
+# defaults, ~/.config/ai-tools/pricing.json, $AI_MODEL_PRICING, and
+# --pricing-file. See shared/pricing/pricing.py.
+#
+# A model with no configured price contributes 0 and is NAMED in
+# `unpriced_models`. It is not silently charged at some neighbouring model's
+# rate: this used to fall back to Opus pricing for anything unrecognized, which
+# produced confident, plausible, wrong numbers for every new model.
+#
+# These remain ESTIMATES for local accounting. /cost and the Anthropic Usage &
+# Cost API are authoritative.
 # ---------------------------------------------------------------------------
-MODEL_PRICING_PER_MTOK = {
-    "opus":   {"input": 5.0,  "output": 25.0},
-    "sonnet": {"input": 3.0,  "output": 15.0},
-    "haiku":  {"input": 1.0,  "output": 5.0},
-    "fable":  {"input": 10.0, "output": 50.0},
-    "mythos": {"input": 10.0, "output": 50.0},
-}
-DEFAULT_PRICING_PER_MTOK = {"input": 5.0, "output": 25.0}
+UNPRICED_MODELS: set[str] = set()
 
 
-def price_for_model(model: str) -> dict:
-    """Match a model id (e.g. 'claude-opus-4-8') to a pricing family by substring."""
-    m = (model or "").lower()
-    for family, price in MODEL_PRICING_PER_MTOK.items():
-        if family in m:
-            return price
-    return DEFAULT_PRICING_PER_MTOK
+def _import_pricing():
+    here = Path(__file__).resolve().parent
+    for candidate in (here, here.parents[2] / "shared" / "pricing"):
+        if (candidate / "pricing.py").exists():
+            sys.path.insert(0, str(candidate))
+            break
+    import pricing as _pricing
+
+    return _pricing
+
+
+pricing_mod = _import_pricing()
+_PRICING = None
+
+
+def get_pricing(path: Optional[str] = None):
+    global _PRICING
+    if _PRICING is None:
+        _PRICING = pricing_mod.load(path)
+    return _PRICING
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int,
                   cache_creation_tokens: int, cache_read_tokens: int) -> float:
-    """Estimate USD cost for one message's usage. Estimate only — see /cost."""
-    p = price_for_model(model)
-    return (
-        input_tokens * p["input"]
-        + output_tokens * p["output"]
-        + cache_creation_tokens * p["input"] * 1.25
-        + cache_read_tokens * p["input"] * 0.10
-    ) / 1_000_000
+    """Estimate USD cost for one message's usage. Estimate only — see /cost.
+
+    Returns 0.0 for a model with no configured price, and records it in
+    UNPRICED_MODELS so callers can say so rather than quietly under-reporting.
+    """
+    cost = get_pricing().cost(model, {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_write": cache_creation_tokens,
+        "cache_read": cache_read_tokens,
+    })
+    if cost is None:
+        if input_tokens or output_tokens or cache_creation_tokens or cache_read_tokens:
+            UNPRICED_MODELS.add(model or "unknown")
+        return 0.0
+    return cost
 
 
 def extract_usage(entry: dict) -> Optional[dict]:
@@ -2553,6 +2573,11 @@ def format_overview(ov: dict) -> str:
         toks = sum(pm[k] for k in _TOKEN_FIELDS)
         lines.append(f"    {short_model(model)}: {toks:,} tokens · est. ${pm['cost']:.4f} "
                      f"({fmt_breakdown(pm)})")
+    if UNPRICED_MODELS:
+        lines.append("")
+        lines.append("  ! Excluded from the cost above — no price configured for: "
+                     + ", ".join(sorted(UNPRICED_MODELS)))
+        lines.append(f"    Add rates to {pricing_mod.USER_FILE} to include them.")
     lines.append("")
     lines.append("  Legend: 'reported' = the workflow orchestrator's own per-agent metric; it")
     lines.append("  excludes cached context, so it is far smaller. 'transcript' sums every usage")
@@ -2582,11 +2607,26 @@ def main():
     parser.add_argument("--out-file", help="Write output to file instead of stdout")
     parser.add_argument("--path", action="store_true",
                         help="Print only the resolved transcript file path and exit")
+    parser.add_argument("--pricing-file",
+                        help="Extra pricing JSON, overriding the defaults")
+    parser.add_argument("--pricing", action="store_true",
+                        help="Show the resolved price table and where it came from")
     parser.add_argument("--overview", action="store_true",
                         help="Show session topology: transcript, sub-agents, "
                              "workflows, offloaded tool results, token totals")
 
     args = parser.parse_args()
+
+    get_pricing(args.pricing_file)
+    if args.pricing:
+        table = get_pricing()
+        print(f"sources: {table.describe()}")
+        for key in sorted(table.models):
+            rates = table.rates(key.rstrip("*"))
+            if rates:
+                print(f"  {key:<26} in {rates['input']:>7.3f}  out {rates['output']:>7.3f}  "
+                      f"cache-w {rates['cache_write']:>7.3f}  cache-r {rates['cache_read']:>7.3f}")
+        return 0
 
     # Handle --path flag: resolve and print the transcript path only (fast, no parsing)
     if args.path:
