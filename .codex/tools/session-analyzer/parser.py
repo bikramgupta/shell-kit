@@ -1171,7 +1171,7 @@ def parse_session(path, max_chars=0, include_raw=False):
 
 # Bump when scan_session's output shape or accounting changes; entries written
 # by an older version are ignored rather than trusted.
-SCAN_SCHEMA_VERSION = 1
+SCAN_SCHEMA_VERSION = 2
 
 
 def scan_session(path):
@@ -1319,6 +1319,11 @@ def _cache_encode(record):
     for key in ("start_ts", "end_ts"):
         value = encoded.get(key)
         encoded[key] = value.isoformat() if isinstance(value, dt.datetime) else None
+    # Cost is derived from prices, which are user-editable data and can change
+    # without any rollout changing. Caching it would let an edited price table
+    # be silently ignored, so only the token counts are stored.
+    encoded.pop("estimated_cost", None)
+    encoded.pop("unknown_cost_models", None)
     return encoded
 
 
@@ -1326,6 +1331,9 @@ def _cache_decode(record):
     decoded = dict(record)
     for key in ("start_ts", "end_ts"):
         decoded[key] = parse_ts(decoded.get(key))
+    decoded["estimated_cost"], decoded["unknown_cost_models"] = estimate_model_usage(
+        decoded.get("model_usage") or {}
+    )
     return decoded
 
 
